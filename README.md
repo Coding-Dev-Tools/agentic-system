@@ -104,6 +104,50 @@ heartbeat_sweep()          # stale agents -> UNRESPONSIVE, CAS their tasks back 
 
 Register them as periodic jobs via `register_sweeps()` (needs a `CronPort`).
 
+## Using with Engraphis (the companion memory engine)
+
+[Engraphis](https://github.com/) is a local-first AI memory engine. agentic-system
+works hand-in-hand with it via a single hook — council verdicts persist to
+Engraphis as durable `council_verdict` memories (episodic, workspace-scoped) so
+they show up in recall/why/timeline alongside everything else your agent knows.
+
+```bash
+pip install agentic-system            # the orchestration layer
+pip install engraphis                  # the memory engine (base install is enough)
+# (once Engraphis is on PyPI; until then install it from source)
+```
+
+```python
+from agentic_system.council import CouncilService, CouncilRequest, make_engraphis_persist_hook
+
+svc = CouncilService(db_path, persist_hook=make_engraphis_persist_hook())
+decision = svc.review(CouncilRequest(subject_type="PR", content=diff, risk_level="medium"))
+# decision is now also a durable Engraphis memory you can recall/why/timeline.
+```
+
+Zero-config: `make_engraphis_persist_hook()` writes to Engraphis's default DB
+(`ENGRAPHIS_DB_PATH`), auto-creates the `hermes-council` workspace, and **never
+crashes the council** — if Engraphis isn't installed or can't be built, the hook
+becomes a no-op and logs a warning. Real semantic recall needs `engraphis[mcp]`;
+the base install uses a deterministic embedder fallback (still durable, just not
+semantic-search-ranked).
+
+### Optional: semantic no-progress detection
+
+The default `NoProgressDetector` uses difflib (catches verbatim loops). For
+semantic looping, back it with embeddings — either sentence-transformers or
+your own callable against Engraphis's embedder:
+
+```bash
+pip install "agentic-system[embeddings]"   # adds sentence-transformers
+```
+```python
+from agentic_system.no_progress import NoProgressDetector
+from agentic_system.embedding_similarity import make_embedding_similarity
+det = NoProgressDetector(window=3, threshold=0.9, similarity=make_embedding_similarity())
+# or build your own:  det = NoProgressDetector(similarity=my_engraphis_cosine)
+```
+
 ## Design invariants
 
 - **LLMs never control flow** — only named FSM events / engine methods move state.

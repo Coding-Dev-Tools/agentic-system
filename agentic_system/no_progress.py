@@ -5,11 +5,14 @@ in the window stays above a threshold AND no new state was written, the agent
 is considered to be looping and the task should fail with
 ``reason="no_progress"``.
 
-Similarity is stdlib ``difflib.SequenceMatcher`` — dependency-free and good
-enough for verbatim/near-verbatim repetition, which is what runaway agent
-loops actually produce. Upgrade path: swap ``_similarity`` for Engraphis'
-embedding cosine similarity if semantic-level looping shows up in practice
-(reuse its embedder; do not add a new embedding stack).
+Similarity defaults to stdlib ``difflib.SequenceMatcher`` — dependency-free and
+good enough for verbatim/near-verbatim repetition, which is what runaway agent
+loops actually produce. Pass a ``similarity=`` callable to upgrade to semantic
+similarity (e.g. sentence-transformer or Engraphis embedding cosine) when
+semantic-level looping shows up in practice — see
+``agentic_system.embedding_similarity`` for a ready-made sentence-transformer
+backing (``pip install "agentic-system[embeddings]"``), or build your own
+against Engraphis' embedder.
 """
 
 from __future__ import annotations
@@ -17,15 +20,20 @@ from __future__ import annotations
 import re
 from collections import deque
 from difflib import SequenceMatcher
+from typing import Callable, Optional
 
 _WS = re.compile(r"\s+")
+
+
+# A similarity fn: (a, b) -> float in [0, 1]. Defaults to difflib ratio.
+SimilarityFn = Callable[[str, str], float]
 
 
 def _normalize(text: str) -> str:
     return _WS.sub(" ", (text or "").strip())
 
 
-def _similarity(a: str, b: str) -> float:
+def default_similarity(a: str, b: str) -> float:
     if not a and not b:
         return 1.0
     return SequenceMatcher(None, a, b).ratio()
@@ -40,15 +48,20 @@ class NoProgressDetector:
         looping = det.observe(tool_output, state_changed=wrote_anything)
         if looping:
             fail_task(reason="no_progress")
+
+    Pass ``similarity=`` to back the comparison with embeddings (semantic loop
+    detection) instead of difflib.
     """
 
     def __init__(self, window: int = 3, threshold: float = 0.97,
-                 max_chars: int = 4000):
+                 max_chars: int = 4000,
+                 similarity: Optional[SimilarityFn] = None):
         if window < 2:
             raise ValueError("window must be >= 2")
         self.window = window
         self.threshold = float(threshold)
         self.max_chars = int(max_chars)
+        self._similarity: SimilarityFn = similarity or default_similarity
         self._outputs: deque[str] = deque(maxlen=window)
         self.trip_count = 0
 
@@ -70,7 +83,7 @@ class NoProgressDetector:
             return False
         outs = list(self._outputs)
         sims = [
-            _similarity(outs[i], outs[j])
+            self._similarity(outs[i], outs[j])
             for i in range(len(outs))
             for j in range(i + 1, len(outs))
         ]
@@ -83,4 +96,4 @@ class NoProgressDetector:
         self._outputs.clear()
 
 
-__all__ = ["NoProgressDetector"]
+__all__ = ["NoProgressDetector", "default_similarity", "SimilarityFn"]

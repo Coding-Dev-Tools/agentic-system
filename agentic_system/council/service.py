@@ -379,17 +379,24 @@ def make_engraphis_persist_hook(namespace_workspace: str = "hermes-council"):
     write — NOT an in-memory DB. (Previously called a nonexistent
     ``create_default()``, which silently left ``svc=None`` so verdicts never
     persisted.)"""
+    import logging
+    log = logging.getLogger("agentic_system.council")
     try:
         from engraphis.service import MemoryService
         from engraphis.config import settings
-    except Exception:
+    except Exception as e:
+        log.warning("engraphis not available -- council verdict persistence disabled (%s)", e)
         return lambda doc: None
-    svc = MemoryService.create(
-        settings.db_path,
-        embed_model=settings.embed_model or None,
-        allowed_workspaces=settings.allowed_workspaces,
-        extractor=settings.extractor,
-    )
+    try:
+        svc = MemoryService.create(
+            settings.db_path,
+            embed_model=settings.embed_model or None,
+            allowed_workspaces=settings.allowed_workspaces,
+            extractor=settings.extractor,
+        )
+    except Exception as e:
+        log.warning("engraphis MemoryService could not be built -- council verdict persistence disabled (%s)", e)
+        return lambda doc: None
 
     def hook(doc: dict) -> Optional[str]:
         out = svc.remember(
