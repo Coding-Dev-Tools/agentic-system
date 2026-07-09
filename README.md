@@ -21,10 +21,22 @@ implement — so it works with Hermes, your own agent, or a custom runtime.
 
 ## Install
 
+**From GitHub** (available now — PyPI publication is the final pending step):
+
 ```bash
 pip install agentic-system            # core: pydantic + PyYAML
-pip install "agentic-system[engraphis]"   # optional: council verdict persistence
-pip install "agentic-system[embeddings]"  # optional: semantic no-progress detection
+# pip install "agentic-system[engraphis]"   # optional: council verdict persistence (once Engraphis is on PyPI)
+# pip install "agentic-system[embeddings]"  # optional: semantic no-progress detection
+```
+
+Until the package is on PyPI, install the wheel/sdist from the [releases page](https://github.com/Coding-Dev-Tools/agentic-system/releases), or from source:
+
+```bash
+pip install git+https://github.com/Coding-Dev-Tools/agentic-system.git
+# extras:
+pip install "agentic-system[embeddings] @ git+https://github.com/Coding-Dev-Tools/agentic-system.git"
+# council verdict persistence (install the companion from its GitHub first):
+pip install git+https://github.com/Coding-Dev-Tools/engraphis.git
 ```
 
 ## Wire it into your agent (the four ports)
@@ -112,9 +124,9 @@ Engraphis as durable `council_verdict` memories (episodic, workspace-scoped) so
 they show up in recall/why/timeline alongside everything else your agent knows.
 
 ```bash
-pip install agentic-system            # the orchestration layer
-pip install engraphis                  # the memory engine (base install is enough)
-# (once Engraphis is on PyPI; until then install it from source)
+pip install git+https://github.com/Coding-Dev-Tools/agentic-system.git   # the orchestration layer
+pip install git+https://github.com/Coding-Dev-Tools/engraphis.git          # the memory engine (base install is enough)
+# (replace with `pip install agentic-system` / `pip install engraphis` once both are on PyPI)
 ```
 
 ```python
