@@ -46,7 +46,7 @@ def test_dry_run_reports_scripts_and_creates_nothing(fake_cron):
     assert cron.created == []
 
 
-def test_registration_creates_all_four_and_writes_wrappers(fake_cron):
+def test_registration_creates_all_sweeps_and_writes_wrappers(fake_cron):
     cron, scripts = fake_cron
     out = register_sweeps()
     assert out["ok"] is True
@@ -65,11 +65,11 @@ def test_registration_creates_all_four_and_writes_wrappers(fake_cron):
 def test_registration_is_idempotent(fake_cron):
     cron, scripts = fake_cron
     register_sweeps()
-    assert len(cron.created) == 4
+    assert len(cron.created) == len(SWEEP_SCHEDULES)
     out2 = register_sweeps()
     assert out2["created"] == []
     assert sorted(out2["skipped"]) == sorted(f"sweep-{n}" for n in SWEEP_SCHEDULES)
-    assert len(cron.created) == 4  # no new jobs
+    assert len(cron.created) == len(SWEEP_SCHEDULES)  # no new jobs
 
 
 def test_cli_register_dispatch_works(fake_cron, capsys):
@@ -77,7 +77,7 @@ def test_cli_register_dispatch_works(fake_cron, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
-    assert len(out["created"]) == 4
+    assert len(out["created"]) == len(SWEEP_SCHEDULES)
 
 
 def test_usage_message_lists_register(capsys):

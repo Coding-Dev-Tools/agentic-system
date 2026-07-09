@@ -86,18 +86,24 @@ class CouncilService:
     def __init__(self, db_path: str, bus: Any = None,
                  members: Optional[list[dict]] = None,
                  thresholds: Optional[dict] = None,
-                 peer_eval: str = "high_risk_only",
-                 min_quorum: int = 2,
+                 peer_eval: Optional[str] = None,
+                 min_quorum: Optional[int] = None,
                  llm_fn: Optional[Callable[[CouncilMember, str, str], str]] = None,
                  persist_hook: Optional[Callable[[dict], Optional[str]]] = None):
         self._conn = connect(db_path)
         ensure_state_tables(self._conn)
         self.bus = bus
         cfg_members, cfg_thresholds, cfg_peer, cfg_quorum = self._load_config()
+        # Precedence: an explicit constructor argument wins over config; config
+        # supplies the default when the argument is None. (Previously
+        # min_quorum/peer_eval let config OVERRIDE the constructor arg, which
+        # was inconsistent with members/thresholds -- now constructor wins
+        # everywhere, the usual Python convention.)
         self.members = [CouncilMember(**m) for m in (members or cfg_members)]
         self.thresholds = CouncilThresholds(**(thresholds or cfg_thresholds))
-        self.peer_eval = peer_eval if peer_eval != "high_risk_only" or cfg_peer is None else cfg_peer
-        self.min_quorum = int(min_quorum if cfg_quorum is None else cfg_quorum)
+        self.peer_eval = peer_eval or cfg_peer or "high_risk_only"
+        self.min_quorum = int(min_quorum if min_quorum is not None
+                             else (cfg_quorum if cfg_quorum is not None else 2))
         self.llm_fn = llm_fn or _default_llm_fn
         self.persist_hook = persist_hook
 

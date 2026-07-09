@@ -22,6 +22,14 @@ from collections import deque
 from difflib import SequenceMatcher
 from typing import Callable, Optional
 
+
+class NoProgress(Exception):
+    """Raised when a no-progress loop is detected.
+
+    A host handler/agent loop raises this (or calls :meth:`NoProgressDetector.raise_if_looping`)
+    to surface a loop as control flow; the workflow worker maps it onto the
+    FSM ``no_progress`` event (EXECUTING -> FAILED) instead of ``tool_error``."""
+
 _WS = re.compile(r"\s+")
 
 
@@ -95,5 +103,16 @@ class NoProgressDetector:
     def reset(self) -> None:
         self._outputs.clear()
 
+    def raise_if_looping(self, output: str, state_changed: bool = False) -> None:
+        """Observe one output and raise :class:`NoProgress` if a loop is detected.
 
-__all__ = ["NoProgressDetector", "default_similarity", "SimilarityFn"]
+        Convenience for hosts that treat loop detection as control flow (the
+        workflow worker catches ``NoProgress`` and drives the FSM ``no_progress``
+        transition). Never raises when ``state_changed`` is True."""
+        if self.observe(output, state_changed=state_changed):
+            raise NoProgress(
+                f"no progress: {self.window} recent outputs >= "
+                f"{self.threshold} similarity (trip #{self.trip_count})")
+
+
+__all__ = ["NoProgressDetector", "default_similarity", "SimilarityFn", "NoProgress"]

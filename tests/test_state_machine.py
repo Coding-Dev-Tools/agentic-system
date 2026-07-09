@@ -2,7 +2,7 @@
 
 import pytest
 
-from agentic_system.no_progress import NoProgressDetector
+from agentic_system.no_progress import NoProgress, NoProgressDetector
 from agentic_system.state_machine import (
     AgentState,
     AgentStateMachine,
@@ -161,6 +161,24 @@ def test_whitespace_normalization():
     d = NoProgressDetector(window=2, threshold=0.99)
     d.observe("result:   42\n")
     assert d.observe("result: 42")
+
+
+def test_raise_if_looping_raises_and_carries_trip_info():
+    d = NoProgressDetector(window=3)
+    d.raise_if_looping("stuck output")
+    d.raise_if_looping("stuck output")
+    with pytest.raises(NoProgress) as ei:
+        d.raise_if_looping("stuck output")
+    assert d.trip_count == 1
+    assert "no progress" in str(ei.value)
+
+
+def test_raise_if_looping_never_raises_on_state_change():
+    d = NoProgressDetector(window=2)
+    # state_changed resets the window -> never trips
+    for _ in range(5):
+        d.raise_if_looping("identical", state_changed=True)
+    assert d.trip_count == 0
 
 
 # ── loop hook wiring (static) ─────────────────────────────────────────────

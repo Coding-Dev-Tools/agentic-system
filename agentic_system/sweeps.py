@@ -1,6 +1,6 @@
 """Deterministic orchestration sweeps (handoff §3.6) — no LLM involvement.
 
-Four sweeps, designed to run as ``no_agent=True`` script cron jobs (the
+Five sweeps, designed to run as ``no_agent=True`` script cron jobs (the
 scheduler's script runner) or from any process:
 
 =================  ========  =====================================================
@@ -12,12 +12,15 @@ stuck_task_sweep   5 min     ASSIGNED/WAITING_DEP tasks past threshold ->
                              requeue (attempts++) or escalate to council/manager
 metric_watchdog    10 min    failure ratios + budget exhaustion counts from the
                              event store -> trip agent/global breakers
+breaker_recovery   2 min     self-heal tripped breakers: OPEN -> HALF_OPEN
+                             after a cooldown; HALF_OPEN -> CLOSED on a clean
+                             probe window (or re-OPEN if failures continue)
 daily_consolidate  nightly   archive-then-prune old events to _archive/ (repo
                              deletion policy); optionally run engraphis
                              consolidation CLI when installed
 =================  ========  =====================================================
 
-CLI:  python -m cron.sweeps <heartbeat|stuck_tasks|metrics|consolidate>
+CLI:  python -m agentic_system.sweeps <heartbeat|stuck_tasks|metrics|breaker_recovery|consolidate|register>
 Env:  AGENTIC_EVENTS_DB (or HERMES_EVENTS_DB, back-compat) overrides the DB path.
 """
 
@@ -31,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from agentic_system.breakers import BreakerRegistry, GLOBAL_KEY
+from agentic_system.breakers import BreakerRegistry, GLOBAL_KEY, HALF_OPEN, OPEN
 from agentic_system.events.bus import EventBus
 from agentic_system.events.hooks import events_db_path
 from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
@@ -51,6 +54,21 @@ def _iso(dt: datetime) -> str:
 
 def _cutoff(seconds: float) -> str:
     return _iso(datetime.now(timezone.utc) - timedelta(seconds=seconds))
+
+
+def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp produced by ``now_iso``/``_iso`` (trailing
+    ``Z``). Returns None on a missing/blank value; raises never (None in -> None
+    out) so callers can fall back to "treat as unknown/not-yet"."""
+    if not ts:
+        return None
+    s = ts.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
 
 
 def _open_all(db_path: Optional[str]):
@@ -230,7 +248,69 @@ def metric_watchdog(db_path: Optional[str] = None,
         breakers.close_conn(); conn.close(); store.close()
 
 
-# ── 4. daily consolidate (nightly) ────────────────────────────────────────
+# ── 4. breaker recovery sweep (2 min) ────────────────────────────────
+
+def breaker_recovery_sweep(db_path: Optional[str] = None,
+                            open_cooldown_s: float = 300.0,
+                            half_open_probe_s: float = 120.0) -> dict[str, Any]:
+    """Self-heal the circuit breakers the metric watchdog trips.
+
+    Without this sweep, a tripped breaker stays OPEN forever (only a manual
+    ``BreakerRegistry.close()`` recovers it) -- which defeats the point of an
+    *autonomous* orchestration layer. Recovery is deterministic and idempotent:
+
+    - OPEN -> HALF_OPEN once ``opened_at`` is older than ``open_cooldown_s``
+      (probation: limited traffic is allowed again).
+    - HALF_OPEN -> CLOSED if no new failure events for the breaker's aggregate
+      arrived in the ``half_open_probe_s`` window (clean probe); otherwise
+      HALF_OPEN -> re-OPEN (the problem is still happening).
+
+    Failure events counted::
+
+        turn.failed, task.failed, workflow.run_failed
+
+    For non-global breakers, only events whose ``aggregate_id`` equals the
+    breaker key count (mirrors how ``metric_watchdog`` attributes failures).
+    """
+    db, conn, store, bus = _open_all(db_path)
+    breakers = BreakerRegistry(db, bus=bus)
+    try:
+        now = datetime.now(timezone.utc)
+        moved_half: list = []
+        closed: list = []
+        reopened: list = []
+        fail_types = ("turn.failed", "task.failed", "workflow.run_failed")
+        for row in breakers.snapshot():
+            level, key, state = row["level"], row["key"], row["state"]
+            if state == OPEN:
+                opened_at = _parse_iso(row.get("opened_at"))
+                if opened_at and (now - opened_at).total_seconds() >= open_cooldown_s:
+                    breakers.half_open(level, key, reason="probation_after_cooldown")
+                    moved_half.append((level, key))
+            elif state == HALF_OPEN:
+                half_at = _parse_iso(row.get("half_open_at"))
+                if not half_at or (now - half_at).total_seconds() < half_open_probe_s:
+                    continue
+                probe_since = _iso(now - timedelta(seconds=half_open_probe_s))
+                fails = 0
+                for c in store.aggregate_counts_by_type(probe_since, fail_types):
+                    if level == "global" or (c.get("aggregate_id") or "") == key:
+                        fails += int(c["n"])
+                if fails > 0:
+                    breakers.open(level, key,
+                                  reason=f"reopened: {fails} failures in probe")
+                    reopened.append((level, key))
+                else:
+                    breakers.close(level, key, reason="clean_probe_window")
+                    closed.append((level, key))
+        return {"sweep": "breaker_recovery",
+                "moved_to_half_open": moved_half, "closed": closed,
+                "reopened": reopened}
+    finally:
+        breakers.close_conn(); conn.close(); store.close()
+
+
+# ── 5. daily consolidate (nightly) ────────────────────────────────────────
 
 def daily_consolidate(db_path: Optional[str] = None,
                       retain_days: float = 14.0,
@@ -269,6 +349,7 @@ _SWEEPS = {
     "heartbeat": heartbeat_sweep,
     "stuck_tasks": stuck_task_sweep,
     "metrics": metric_watchdog,
+    "breaker_recovery": breaker_recovery_sweep,
     "consolidate": daily_consolidate,
 }
 
@@ -277,12 +358,13 @@ SWEEP_SCHEDULES = {
     "heartbeat": "*/1 * * * *",
     "stuck_tasks": "*/5 * * * *",
     "metrics": "*/10 * * * *",
+    "breaker_recovery": "*/2 * * * *",
     "consolidate": "0 3 * * *",
 }
 
 
 def register_sweeps(dry_run: bool = False) -> dict[str, Any]:
-    """Idempotently register the four orchestration sweeps as cron jobs via
+    """Idempotently register the orchestration sweeps as cron jobs via
     the host's CronPort.
 
     Writes a small ``.py`` wrapper per sweep into the CronPort's ``scripts_dir``

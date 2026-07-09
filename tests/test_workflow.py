@@ -242,3 +242,37 @@ def test_worker_materializes_cooldown_state_on_failure(tmp_path):
                        ("worker-fail",)).fetchone()
     conn.close(); w.close(); eng.close()
     assert row is not None and row["status"] == "COOLDOWN"
+
+
+def test_worker_no_progress_drives_dedicated_fsm_event(tmp_path):
+    """A handler raising NoProgress maps onto the FSM ``no_progress`` event
+    (EXECUTING -> FAILED), not ``tool_error``, and is recorded with reason
+    no_progress."""
+    from agentic_system.no_progress import NoProgress
+    from agentic_system.state_machine import AgentState
+
+    eng = _engine(tmp_path)
+    eng.start_run("linear")
+
+    det_calls = {"n": 0}
+
+    def looping(task):
+        # a handler that detects a loop and raises NoProgress (e.g. via
+        # detector.raise_if_looping); the worker bridges it to the FSM.
+        det_calls["n"] += 1
+        raise NoProgress("identical output 3x in a row")
+
+    w = WorkflowWorker("worker-np", eng, {"CODEGEN": looping, "TEST": looping},
+                        cooldown_seconds=0.0)
+    w.run_once()
+    assert w.fsm.state in (AgentState.COOLDOWN, AgentState.IDLE)
+    # the FSM took the no_progress transition -> counter advanced, tool_error did NOT
+    assert w.fsm.no_progress_counter == 1
+    # task was failed (requeued or failed) with the no_progress reason
+    row = eng._conn.execute(
+        "SELECT status, attempts FROM tasks WHERE type='CODEGEN'").fetchone()
+    assert row is not None
+    evs = [e for _, e in EventStore(eng.db_path).read_since(
+        0, types=("task.failed", "task.requeued"))]
+    assert evs and "no_progress" in (evs[-1].payload.get("reason") or "")
+    w.close(); eng.close()

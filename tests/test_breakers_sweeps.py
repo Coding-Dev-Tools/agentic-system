@@ -10,6 +10,7 @@ from agentic_system.events.envelope import EventEnvelope
 from agentic_system.events.state_tables import connect, ensure_state_tables, heartbeat
 from agentic_system.events.store import EventStore
 from agentic_system.sweeps import (
+    breaker_recovery_sweep,
     daily_consolidate,
     heartbeat_sweep,
     metric_watchdog,
@@ -192,3 +193,73 @@ def test_consolidate_archives_then_prunes(db, tmp_path):
     assert "ancient" in open(out["archive"], encoding="utf-8").read()
     assert store.count() == 1
     store.close()
+
+
+# ── breaker recovery sweep ─────────────────────────────────────────────────
+
+def _backdate_breaker(conn, level, key, *, opened=False, half_open=False, age_s=3600):
+    ts = _iso_ago(age_s)
+    conn.execute(
+        "UPDATE breakers SET opened_at=?, half_open_at=? WHERE level=? AND key=?",
+        (ts if opened else None, ts if half_open else None, level, key))
+    conn.commit()
+
+
+def test_recovery_moves_open_to_half_open_after_cooldown(db):
+    p, conn = db
+    r = BreakerRegistry(p)
+    r.open("agent", "flaky", "errors")
+    r.close_conn()
+    _backdate_breaker(conn, "agent", "flaky", opened=True, age_s=400)
+    out = breaker_recovery_sweep(p, open_cooldown_s=300, half_open_probe_s=120)
+    assert out["moved_to_half_open"] == [("agent", "flaky")]
+    assert out["closed"] == [] and out["reopened"] == []
+    r2 = BreakerRegistry(p)
+    assert r2.state("agent", "flaky") == "HALF_OPEN"
+    r2.close_conn()
+
+
+def test_recovery_closes_half_open_on_clean_probe(db):
+    p, conn = db
+    r = BreakerRegistry(p)
+    r.open("agent", "flaky", "errors")
+    r.half_open("agent", "flaky")  # now HALF_OPEN
+    r.close_conn()
+    _backdate_breaker(conn, "agent", "flaky", half_open=True, age_s=200)
+    # no failure events in the probe window -> should CLOSE
+    out = breaker_recovery_sweep(p, open_cooldown_s=300, half_open_probe_s=120)
+    assert out["closed"] == [("agent", "flaky")]
+    assert out["reopened"] == []
+    r2 = BreakerRegistry(p)
+    assert r2.state("agent", "flaky") == "CLOSED"
+    r2.close_conn()
+
+
+def test_recovery_reopens_half_open_on_new_failures(db):
+    p, conn = db
+    store = EventStore(p)
+    _emit_n(store, "turn.failed", 3, agg="flaky")  # failures during probation
+    r = BreakerRegistry(p)
+    r.open("agent", "flaky", "errors")
+    r.half_open("agent", "flaky")
+    r.close_conn()
+    _backdate_breaker(conn, "agent", "flaky", half_open=True, age_s=200)
+    out = breaker_recovery_sweep(p, open_cooldown_s=300, half_open_probe_s=120)
+    assert out["reopened"] == [("agent", "flaky")]
+    assert out["closed"] == []
+    r2 = BreakerRegistry(p)
+    assert r2.state("agent", "flaky") == "OPEN"
+    r2.close_conn(); store.close()
+
+
+def test_recovery_recovers_global_and_ignores_too_recent(db):
+    p, conn = db
+    r = BreakerRegistry(p)
+    r.open("global", GLOBAL_KEY, "incident")
+    r.close_conn()
+    # opened just now -> cooldown NOT elapsed -> stays OPEN (no premature recovery)
+    out = breaker_recovery_sweep(p, open_cooldown_s=300, half_open_probe_s=120)
+    assert out["moved_to_half_open"] == []
+    r2 = BreakerRegistry(p)
+    assert r2.is_open("global", GLOBAL_KEY)
+    r2.close_conn()

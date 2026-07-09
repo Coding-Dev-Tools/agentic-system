@@ -143,14 +143,15 @@ def test_register_sweeps_uses_cron_port(restore, tmp_path):
     ports.set_config_port(_FakeConfigPort(enabled=True, db=str(tmp_path / "e.db")))
     cron = _FakeCronPort(scripts_dir=str(tmp_path / "scripts"))
     ports.set_cron_port(cron)
-    from agentic_system.sweeps import register_sweeps
+    from agentic_system.sweeps import register_sweeps, SWEEP_SCHEDULES
     out = register_sweeps()
     assert out["ok"] is True
-    assert len(out["created"]) == 4
+    n = len(SWEEP_SCHEDULES)
+    assert len(out["created"]) == n
     # idempotent
     cron.names = list(out["created"])
     out2 = register_sweeps()
-    assert out2["created"] == [] and len(out2["skipped"]) == 4
+    assert out2["created"] == [] and len(out2["skipped"]) == n
 
 
 def test_register_sweeps_without_cron_port_reports_error(restore):
@@ -176,3 +177,22 @@ def test_protocols_are_runtime_checkable():
     assert isinstance(_FakeConfigPort(), ports.ConfigPort)
     assert isinstance(_FakeTokenBudgetPort(), ports.TokenBudgetPort)
     assert isinstance(_FakeCronPort(), ports.CronPort)
+
+
+def test_council_constructor_args_override_config(restore, tmp_path):
+    """An explicit constructor argument wins over config for ALL fields
+    (members, thresholds, peer_eval, min_quorum) -- one consistent rule."""
+    ports.set_config_port(_FakeConfigPort(council={
+        "members": [{"id": "cfg-model", "weight": 1.0}],
+        "thresholds": {"min_overall": 2.0},
+        "peer_eval": "never", "min_quorum": 1}))
+    from agentic_system.council import CouncilService
+    svc = CouncilService(
+        str(tmp_path / "p.db"),
+        members=[{"id": "ctor-model", "weight": 1.0}],
+        thresholds={"min_overall": 4.5}, peer_eval="always", min_quorum=5)
+    assert [m.id for m in svc.members] == ["ctor-model"]
+    assert svc.thresholds.min_overall == 4.5
+    assert svc.peer_eval == "always"        # ctor wins (previously config won here)
+    assert svc.min_quorum == 5              # ctor wins (previously config won here)
+    svc.close()

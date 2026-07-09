@@ -108,13 +108,21 @@ python -m agentic_system.orchestration_status --db /path/events.db --tail 50
 ## Sweeps
 
 ```python
-from agentic_system.sweeps import heartbeat_sweep, stuck_task_sweep, metric_watchdog, daily_consolidate
+from agentic_system.sweeps import (
+    heartbeat_sweep, stuck_task_sweep, metric_watchdog,
+    breaker_recovery_sweep, daily_consolidate)
 heartbeat_sweep()          # stale agents -> UNRESPONSIVE, CAS their tasks back to PENDING
+daily_consolidate()        # archive-then-prune old events to _archive/
 # or run from the CLI:
 # $ python -m agentic_system.sweeps heartbeat
 ```
 
-Register them as periodic jobs via `register_sweeps()` (needs a `CronPort`).
+The `metric_watchdog` **trips** circuit breakers from failure metrics;
+`breaker_recovery_sweep` **self-heals** them (OPEN -> HALF_OPEN after a cooldown,
+then HALF_OPEN -> CLOSED on a clean probe, or re-OPEN if failures continue) —
+without it, a tripped breaker stays OPEN until a manual `close()`.
+
+Register all of them as periodic jobs via `register_sweeps()` (needs a `CronPort`).
 
 ## Using with Engraphis (the companion memory engine)
 
