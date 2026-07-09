@@ -1,4 +1,4 @@
-"""Shared materialized-view tables in hermes_events.db (handoff §4).
+"""Shared materialized-view tables in the events DB.
 
 The events table is the system of record; these tables are projections kept
 current by their owners (workflow engine, breaker registry, sweeps, council).
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from typing import Optional
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS agent_instances (
@@ -97,7 +98,7 @@ def ensure_state_tables(conn: sqlite3.Connection) -> None:
 
 
 def heartbeat(conn: sqlite3.Connection, agent_id: str, role: str = "",
-              status: str = None) -> None:
+              status: Optional[str] = None) -> None:
     """Workers call this periodically; heartbeat_sweep reads it."""
     ts = now_iso()
     conn.execute(

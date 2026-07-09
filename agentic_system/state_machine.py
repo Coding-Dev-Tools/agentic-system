@@ -1,4 +1,4 @@
-"""Explicit agent finite state machine (handoff §3.1).
+"""Explicit agent finite state machine.
 
 Formalizes the states that were implicit in the conversation loop
 (TurnRetryState = RETRYING bookkeeping, IterationBudget/TokenBudget =
@@ -43,7 +43,7 @@ class InvalidTransition(Exception):
         super().__init__(f"event {event!r} is not valid in state {state.value}")
 
 
-# (current_state, event) -> next_state — handoff §1.2 transition table,
+# (current_state, event) -> next_state -- the transition table,
 # plus claim_lost (CAS race), dependency_failed, budget/no-progress exits.
 TRANSITIONS: dict[tuple[AgentState, str], AgentState] = {
     (AgentState.IDLE, "task_available"): AgentState.CLAIM_TASK,
@@ -174,7 +174,7 @@ class AgentStateMachine:
         }
 
 
-# ── Per-state tool policy (cheapest hallucination guard, handoff §3.1) ────
+# ── Per-state tool policy (cheapest hallucination guard) ─────
 #
 # Config override lives under ``orchestration.state_allowed_tools`` in
 # config.yaml, keyed by state name, values ``{"allow": [...], "deny": [...]}``

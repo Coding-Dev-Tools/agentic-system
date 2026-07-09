@@ -1,4 +1,4 @@
-"""Model Council service (handoff §3.5): parallel reviews -> weighted decision.
+"""Model Council service: parallel reviews -> weighted decision.
 
 Stage 1: fan the same structured-review prompt across N configured council
 members in parallel (reusing the auxiliary call_llm() path, which already
@@ -75,11 +75,13 @@ def _default_llm_fn(member: CouncilMember, system: str, user: str) -> str:
     return get_default_llm_fn()(member, system, user)
 
 
-def _extract_json(text: str) -> dict:
+def _extract_json(text: str) -> dict[str, Any]:
     m = _JSON_RE.search(text or "")
     if not m:
         raise ValueError("no JSON object in model output")
-    return json.loads(m.group(0))
+    result = json.loads(m.group(0))
+    assert isinstance(result, dict)
+    return result
 
 
 class CouncilService:
@@ -220,7 +222,7 @@ class CouncilService:
                     evals[e.evaluator_model_id] = e
         return evals
 
-    # ── stage 3: deterministic aggregation (handoff pseudo-code) ─────────
+    # ── stage 3: deterministic weighted aggregation ─────────
     def _aggregate(self, session_id: str, reviews: dict[str, ModelReview],
                    peer_evals: dict[str, PeerEval]) -> CouncilDecision:
         weights = {m.id: m.weight for m in self.members}
@@ -412,7 +414,8 @@ def make_engraphis_persist_hook(namespace_workspace: str = "hermes-council"):
             title=f"Council {doc['decision']}: {doc['subject_type']} {doc['session_id']}",
             source="agent:council", kind="council_verdict", importance=0.6,
         )
-        return out.get("id")
+        result = out.get("id")
+        return str(result) if result is not None else None
 
     return hook
 

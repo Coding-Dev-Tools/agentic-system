@@ -1,4 +1,4 @@
-# Review & Test pipeline (handoff §3.4 workflow b):
+# Review & Test pipeline:
 # CODE -> {TESTGEN -> TEST, ANALYZE} -> COUNCIL_REVIEW (diamond join).
 name: review_and_test
 description: >

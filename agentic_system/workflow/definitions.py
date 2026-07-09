@@ -1,4 +1,4 @@
-"""Workflow (DAG) definitions — YAML or dicts, validated up front (handoff §3.4).
+"""Workflow (DAG) definitions -- YAML or dicts, validated up front.
 
 A workflow is a set of nodes; each node produces exactly one Task per run.
 Edges are ``depends_on``. Validation rejects unknown deps and cycles at load
@@ -98,7 +98,7 @@ def load_yaml(path: "str | Path") -> WorkflowDef:
         return from_dict(yaml.safe_load(f))
 
 
-def load_directory(dir_path: "str | Path" = None) -> dict[str, WorkflowDef]:
+def load_directory(dir_path: Optional["str | Path"] = None) -> dict[str, WorkflowDef]:
     """Load all *.yaml workflow definitions (default: this package's
     ``definitions/`` directory)."""
     base = Path(dir_path) if dir_path else Path(__file__).parent / "definitions"

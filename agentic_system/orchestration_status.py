@@ -80,6 +80,13 @@ def collect(db_path: str, tail: int = 25) -> dict[str, Any]:
             "priority, created_at FROM events ORDER BY seq DESC LIMIT ?", (int(tail),))
         event_counts = _rows(conn,
             "SELECT type, COUNT(*) AS n FROM events GROUP BY type ORDER BY n DESC")
+
+        def _count(sql: str) -> int:
+            rows = _rows(conn, sql)
+            if rows and "c" in rows[0]:
+                return int(rows[0]["c"])
+            return 0
+
         out = {
             "db_path": db_path, "exists": True,
             "breakers": breakers,
@@ -91,9 +98,7 @@ def collect(db_path: str, tail: int = 25) -> dict[str, Any]:
             "council_sessions": council,
             "event_counts": event_counts,
             "recent_events": events,
-            "total_events": (lambda r: int(r["c"]) if r else 0)(
-                (_rows(conn, "SELECT COUNT(*) AS c FROM events") or [None])[0]
-            ),
+            "total_events": _count("SELECT COUNT(*) AS c FROM events"),
         }
         return out
     finally:

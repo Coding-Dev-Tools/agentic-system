@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic-system"
-version = "0.1.0"
+version = "0.2.0"
 description = "Framework-agnostic orchestration layer for autonomous agents: durable event store, deterministic FSM, circuit breakers, no-progress detection, workflow DAG engine, model council, sweeps, and a status/health CLI."
 readme = "README.md"
 license = { text = "MIT" }
@@ -52,3 +52,24 @@ line-length = 100
 # High-signal, low-nag: syntax errors + pyflakes (unused imports/vars).
 # Deliberately NOT a full style enforcer (no E1xx/E2xx style nags).
 select = ["E9", "F"]
+
+[tool.mypy]
+# Guard the py.typed contract: catch real type errors without being overly strict.
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = false  # not a fully typed codebase yet
+ignore_missing_imports = true  # optional deps (engraphis, sentence-transformers) may be missing
+exclude = ["tests/*", "examples/*"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["agentic_system.embedding_similarity"]
+# sentence-transformers is optional; ignore its untyped internals
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["agentic_system.council.service"]
+# engraphis is optional
+ignore_missing_imports = true

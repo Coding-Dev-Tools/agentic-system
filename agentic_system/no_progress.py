@@ -1,4 +1,4 @@
-"""No-progress (loop) detection for agent tool-call cycles (handoff §3.6).
+"""No-progress (loop) detection for agent tool-call cycles.
 
 Tracks a small window of recent tool outputs; when every pairwise similarity
 in the window stays above a threshold AND no new state was written, the agent

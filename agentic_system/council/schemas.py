@@ -1,4 +1,4 @@
-"""Pydantic schemas for the Model Council (handoff §3.5).
+"""Pydantic schemas for the Model Council.
 
 Structured in/out at every boundary: model responses are parsed into
 ModelReview and REJECTED if malformed — a council member that cannot produce

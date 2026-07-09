@@ -1,9 +1,9 @@
-"""Minimal DAG executor over the shared state tables (handoff §3.4).
+"""Minimal DAG executor over the shared state tables.
 
 Not Temporal/Airflow: one SQLite DB, CAS task claiming, event emission for
 every lifecycle change. The engine keeps NO in-memory state — runs, tasks and
-node readiness are always derived from the tables, which is what makes a pm2
-restart a non-event (acceptance criterion, handoff §5 phase 3): construct a
+node readiness are always derived from the tables, which is what makes a worker
+process restart a non-event: construct a
 new engine on the same DB and call ``advance(run_id)`` (or just keep claiming
 tasks) to resume from where the previous process died.
 
@@ -103,14 +103,14 @@ class WorkflowEngine:
                 pending_events.append((
                     "task.created",
                     {"task_id": task_id, "task_type": node.task_type,
-                     "required_role": node.required_role, "node_id": nid},
+                     "required_role": node.required_role or "", "node_id": nid},
                     dict(aggregate_type="Task", aggregate_id=task_id,
                          correlation_id=run_id),
                 ))
                 tasks[nid] = {"status": "PENDING"}
 
         # settle run status + execution cursor
-        statuses = {nid: tasks.get(nid, {}).get("status") for nid in wf.nodes}
+        statuses: dict[str, str] = {nid: tasks.get(nid, {}).get("status", "PENDING") for nid in wf.nodes}
         frontier = next((nid for nid in wf.topo_order()
                          if statuses[nid] not in (_TERMINAL_OK,)), None)
         if any(s == _TERMINAL_BAD for s in statuses.values()):
@@ -125,7 +125,7 @@ class WorkflowEngine:
         )
         self._conn.commit()
         for etype, payload, kw in pending_events:
-            self.bus.publish(etype, payload, **kw)
+            self.bus.publish(etype, payload, **kw)  # type: ignore[arg-type]
         if evt:
             self.bus.publish(evt, {"run_id": run_id, "workflow": run["workflow_name"]},
                              aggregate_type="WorkflowRun", aggregate_id=run_id,
@@ -205,7 +205,7 @@ class WorkflowEngine:
                              {"task_id": task_id, "reason": reason, "attempts": attempts},
                              aggregate_type="Task", aggregate_id=task_id,
                              correlation_id=task["workflow_run_id"], priority="high")
-            # escalation hook — the council/manager consumes this (handoff §3.5)
+            # escalation hook -- the council consumes this
             self.bus.publish("council.escalation_requested",
                              {"task_id": task_id, "node_id": task["node_id"],
                               "reason": f"retries_exhausted: {reason}"},

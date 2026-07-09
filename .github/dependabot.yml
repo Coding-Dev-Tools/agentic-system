@@ -1,0 +1,30 @@
+# Dependabot updates for agentic-system
+
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    # Only update the core + extras deps; ignore major jumps by default
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    # Group related updates
+    groups:
+      core:
+        patterns: ["pydantic*", "PyYAML*"]
+      test:
+        patterns: ["pytest*"]
+      embeddings:
+        patterns: ["sentence-transformers*", "torch*"]
+      engraphis:
+        patterns: ["engraphis*"]
+    # Limit to 5 open PRs at a time
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: "scope"

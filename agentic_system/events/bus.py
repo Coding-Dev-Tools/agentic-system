@@ -5,7 +5,7 @@ in-process listeners (used by the gateway to bridge onto the existing
 workspace SSE stream). Cross-process consumers use ``subscribe()`` — a
 background poll loop with a per-consumer durable cursor (at-least-once).
 
-Poll interval 250–500 ms is fine at our scale (handoff §3.2).
+Poll interval 250-500 ms is fine at this scale.
 """
 
 from __future__ import annotations

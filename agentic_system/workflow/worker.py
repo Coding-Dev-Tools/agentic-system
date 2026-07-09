@@ -4,7 +4,7 @@ The deterministic seam between the workflow engine and probabilistic work:
 handlers do the actual work (an AIAgent turn, a subprocess test run, a council
 session) and return an ``output_ref`` (ideally an Engraphis memory id). The
 worker owns all control flow — FSM transitions, heartbeats, per-state tool
-policy, budgets — so LLM output can never steer the DAG (handoff §2 invariant).
+policy, budgets -- so LLM output can never steer the DAG.
 """
 
 from __future__ import annotations

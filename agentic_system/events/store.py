@@ -1,13 +1,13 @@
 """Append-only SQLite event store (WAL) — system of record for control flow.
 
 Separate DB from ``engraphis.db`` on purpose: memory has decay/consolidation
-semantics; control flow needs exact ordering, replay, and no decay
-(handoff §3.2). Single-box, SQLite-first — no Redis/NATS until multi-host.
+semantics; control flow needs exact ordering, replay, and no decay.
+Single-box, SQLite-first -- no Redis/NATS until multi-host.
 
 Concurrency: one connection guarded by a lock, WAL mode, busy_timeout.
-Multiple pm2 processes should each open their own EventStore; SQLite WAL
+Multiple worker processes should each open their own EventStore; SQLite WAL
 handles cross-process readers. If writer contention ever shows up, route
-writes through the gateway (handoff §6.2).
+writes through a single writer (e.g. a gateway process).
 """
 
 from __future__ import annotations
@@ -92,7 +92,9 @@ class EventStore:
                 ),
             )
             self._conn.commit()
-            return int(cur.lastrowid)
+            rid = cur.lastrowid
+            assert rid is not None
+            return int(rid)
 
     def append_many(self, events: Iterable[EventEnvelope]) -> list[int]:
         """Append many events in ONE transaction (a single commit, not one per
@@ -119,7 +121,9 @@ class EventStore:
                         json.dumps(event.payload, ensure_ascii=False, default=str),
                     ),
                 )
-                seqs.append(int(cur.lastrowid))
+                rid = cur.lastrowid
+                assert rid is not None
+                seqs.append(int(rid))
             self._conn.commit()
         return seqs
 

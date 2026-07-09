@@ -1,11 +1,11 @@
-"""Three-level circuit breakers: agent / workflow / global (handoff §3.6).
+"""Three-level circuit breakers: agent / workflow / global.
 
-Layering: the host watchdog (pm2/process liveness, every 10 min) is the layer
+Layering: the host process-liveness watchdog (every 10 min) is the layer
 BELOW this and stays untouched; breakers are behavioral safety ABOVE it —
 they stop agents from *doing* things, not processes from running.
 
 States: CLOSED (normal) → OPEN (tripped) → HALF_OPEN (probation) → CLOSED.
-Persisted in hermes_events.db so restarts are idempotent (handoff §6.5).
+Persisted so restarts are idempotent (state survives in the events DB).
 
 Global-open side effects:
 - ``breaker.opened`` (priority=critical) on the event bus,
@@ -35,8 +35,8 @@ GLOBAL_KEY = "system"
 # BreakerRegistry, e.g. a host points it at its incident-log file).
 _DEFAULT_ALERT: Optional[str] = None
 
-# Tool-name patterns blocked when the global breaker is OPEN (handoff §3.1
-# high-impact set). Kept in sync with agent.state_machine._HIGH_IMPACT.
+# Tool-name patterns blocked when the global breaker is OPEN (the
+# high-impact set). Kept in sync with state_machine._HIGH_IMPACT.
 HIGH_IMPACT_PATTERNS = (
     "deploy*", "*git_push*", "*push_to_remote*",
     "publish*", "release*", "*prod*deploy*",
@@ -154,7 +154,7 @@ class BreakerRegistry:
 
     def should_accept_task(self, agent_id: Optional[str] = None,
                            workflow: Optional[str] = None) -> bool:
-        """Check all three levels before any task claim (handoff §3.6)."""
+        """Check all three levels before any task claim."""
         if self.is_open("global", GLOBAL_KEY):
             return False
         if workflow and self.is_open("workflow", workflow):

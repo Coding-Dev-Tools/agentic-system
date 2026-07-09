@@ -1,4 +1,4 @@
-# Nightly refactor sweep (handoff §3.4 workflow a) — formalizes the fleet's
+# Nightly refactor sweep -- formalizes the fleet's
 # informal cron job as a DAG with council gating before anything lands.
 name: refactor_sweep
 description: >

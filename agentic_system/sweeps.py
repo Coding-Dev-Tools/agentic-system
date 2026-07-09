@@ -1,4 +1,4 @@
-"""Deterministic orchestration sweeps (handoff §3.6) — no LLM involvement.
+"""Deterministic orchestration sweeps -- no LLM involvement.
 
 Five sweeps, designed to run as ``no_agent=True`` script cron jobs (the
 scheduler's script runner) or from any process:
@@ -32,7 +32,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agentic_system.breakers import BreakerRegistry, GLOBAL_KEY, HALF_OPEN, OPEN
 from agentic_system.events.bus import EventBus
@@ -276,9 +276,9 @@ def breaker_recovery_sweep(db_path: Optional[str] = None,
     breakers = BreakerRegistry(db, bus=bus)
     try:
         now = datetime.now(timezone.utc)
-        moved_half: list = []
-        closed: list = []
-        reopened: list = []
+        moved_half: list[tuple[str, str]] = []
+        closed: list[tuple[str, str]] = []
+        reopened: list[tuple[str, str]] = []
         fail_types = ("turn.failed", "task.failed", "workflow.run_failed")
         for row in breakers.snapshot():
             level, key, state = row["level"], row["key"], row["state"]
@@ -345,7 +345,7 @@ def daily_consolidate(db_path: Optional[str] = None,
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
-_SWEEPS = {
+_SWEEPS: dict[str, Callable[[], Any]] = {
     "heartbeat": heartbeat_sweep,
     "stuck_tasks": stuck_task_sweep,
     "metrics": metric_watchdog,
