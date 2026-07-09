@@ -11,6 +11,10 @@ dist/
 .coverage
 htmlcov/
 
+# Type-checker cache
+.mypy_cache/
+.ruff_cache/
+
 # Local event stores / runtime data
 *.db
 *.db-journal
@@ -26,6 +30,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
 # Local build output (do not ship build artifacts in the repo)
 dist-build/
 *.whl
