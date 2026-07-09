@@ -19,7 +19,7 @@ See README.md for the full wiring guide.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from . import ports  # noqa: F401  (the adapter seam; host registers here)
 

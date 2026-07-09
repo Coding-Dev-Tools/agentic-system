@@ -127,13 +127,13 @@ def test_fail_requeue_then_exhaust_fails_run(tmp_path):
 
 
 def test_restart_resume_from_tables(tmp_path):
-    """Acceptance (handoff §5 phase 3): a run survives a process restart."""
+    """Acceptance: a run survives a process restart."""
     eng1 = _engine(tmp_path)
     run_id = eng1.start_run("linear", {"repo": "demo"})
     a = eng1.list_tasks(run_id)[0]
     eng1.claim_task(a["id"], "w1"); eng1.complete_task(a["id"])
     assert eng1.get_run(run_id)["current_node_id"] == "b"
-    eng1.close()  # pm2 kill
+    eng1.close()  # simulate process restart
 
     eng2 = _engine(tmp_path)  # new process, same DB
     run = eng2.get_run(run_id)

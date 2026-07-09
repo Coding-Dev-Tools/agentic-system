@@ -5,7 +5,7 @@ Formalizes the states that were implicit in the conversation loop
 EXECUTING guards, retry_utils recovery guards = transition triggers) into a
 deterministic, event-emitting FSM.
 
-Invariant (the single most important one in the handoff): **LLMs never
+Invariant (the single most important one): **LLMs never
 control flow.** Model output is data; only named events drive transitions,
 and an event not present in the transition table raises
 :class:`InvalidTransition` instead of silently doing something.
