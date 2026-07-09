@@ -26,3 +26,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+# Local build output (do not ship build artifacts in the repo)
+dist-build/
+*.whl
+*.tar.gz
