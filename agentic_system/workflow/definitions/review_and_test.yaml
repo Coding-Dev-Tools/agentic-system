@@ -1,0 +1,25 @@
+# Review & Test pipeline (handoff §3.4 workflow b):
+# CODE -> {TESTGEN -> TEST, ANALYZE} -> COUNCIL_REVIEW (diamond join).
+name: review_and_test
+description: >
+  Generate code, then fan out to test generation/execution and static
+  analysis in parallel; the council reviews only after both legs complete.
+nodes:
+  - id: code
+    task_type: CODEGEN
+    required_role: coder
+  - id: testgen
+    task_type: TESTGEN
+    depends_on: [code]
+    required_role: tester
+  - id: run_tests
+    task_type: TEST
+    depends_on: [testgen]
+    max_attempts: 2
+  - id: analyze
+    task_type: ANALYZE
+    depends_on: [code]
+  - id: council_review
+    task_type: COUNCIL_REVIEW
+    depends_on: [run_tests, analyze]
+    params: {risk_level: medium, decision_type: PR}

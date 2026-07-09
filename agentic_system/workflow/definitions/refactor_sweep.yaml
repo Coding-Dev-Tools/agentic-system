@@ -1,0 +1,28 @@
+# Nightly refactor sweep (handoff §3.4 workflow a) — formalizes the fleet's
+# informal cron job as a DAG with council gating before anything lands.
+name: refactor_sweep
+description: >
+  Identify code hotspots, plan low-risk refactors, apply them, run the test
+  suite, and gate the result on a Model Council review.
+nodes:
+  - id: identify_hotspots
+    task_type: ANALYZE
+    params: {detector: lint_hotspots, scope: repo}
+    max_attempts: 2
+  - id: plan_refactors
+    task_type: PLAN
+    depends_on: [identify_hotspots]
+    required_role: planner
+  - id: apply_refactors
+    task_type: REFACTOR
+    depends_on: [plan_refactors]
+    required_role: coder
+    max_attempts: 3
+  - id: run_tests
+    task_type: TEST
+    depends_on: [apply_refactors]
+    max_attempts: 2
+  - id: council_review
+    task_type: COUNCIL_REVIEW
+    depends_on: [run_tests]
+    params: {risk_level: medium, decision_type: MERGE}

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test / cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local event stores / runtime data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

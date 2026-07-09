@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-system"
+version = "0.1.0"
+description = "Framework-agnostic orchestration layer for autonomous agents: durable event store, deterministic FSM, circuit breakers, no-progress detection, workflow DAG engine, model council, sweeps, and a status/health CLI."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Hermes Agent contributors" }]
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "PyYAML>=5.4",
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+engraphis = ["engraphis"]          # council verdict persistence to Engraphis
+embeddings = ["sentence-transformers"]  # semantic no-progress detection upgrade path
+test = ["pytest>=7"]
+
+[project.scripts]
+agentic-status = "agentic_system.orchestration_status:main"
+
+[tool.setuptools.packages.find]
+include = ["agentic_system*"]
+
+[tool.setuptools.package-data]
+agentic_system = ["workflow/definitions/*.yaml"]
