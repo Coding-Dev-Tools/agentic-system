@@ -8,8 +8,9 @@ version = "0.1.0"
 description = "Framework-agnostic orchestration layer for autonomous agents: durable event store, deterministic FSM, circuit breakers, no-progress detection, workflow DAG engine, model council, sweeps, and a status/health CLI."
 readme = "README.md"
 license = { text = "MIT" }
-authors = [{ name = "Hermes Agent contributors" }]
+authors = [{ name = "agentic-system contributors" }]
 requires-python = ">=3.10"
+keywords = ["agent", "orchestration", "llm", "council", "circuit-breaker", "fsm", "workflow", "autonomous-agents"]
 dependencies = [
     "pydantic>=2.0",
     "PyYAML>=5.4",
@@ -17,8 +18,18 @@ dependencies = [
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Intended Audience :: Developers",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Coding-Dev-Tools/agentic-system"
+Repository = "https://github.com/Coding-Dev-Tools/agentic-system"
+Issues = "https://github.com/Coding-Dev-Tools/agentic-system/issues"
+Changelog = "https://github.com/Coding-Dev-Tools/agentic-system/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 engraphis = ["engraphis"]          # council verdict persistence to Engraphis
@@ -32,4 +43,12 @@ agentic-status = "agentic_system.orchestration_status:main"
 include = ["agentic_system*"]
 
 [tool.setuptools.package-data]
-agentic_system = ["workflow/definitions/*.yaml"]
+agentic_system = ["py.typed", "workflow/definitions/*.yaml"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# High-signal, low-nag: syntax errors + pyflakes (unused imports/vars).
+# Deliberately NOT a full style enforcer (no E1xx/E2xx style nags).
+select = ["E9", "F"]

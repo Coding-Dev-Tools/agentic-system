@@ -2,7 +2,6 @@
 
 Single envelope for all control-flow events (task lifecycle, workflow
 transitions, agent state changes, council decisions, breaker trips).
-Adopted verbatim from HERMES_ENGRAPHIS_AGENTIC_UPGRADE_HANDOFF.md §3.2.
 
 Design rules:
 - Validated with pydantic on both publish and consume; malformed events are

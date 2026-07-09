@@ -1,8 +1,6 @@
 """Phase 0 tests: envelope validation, store durability, bus delivery."""
 
-import os
 import threading
-import time
 
 import pytest
 
@@ -184,7 +182,7 @@ def test_poison_event_skipped_after_max_failures(store):
 
 def test_hooks_disabled_by_default(monkeypatch, tmp_path):
     from agentic_system.events import hooks
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "0")
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "0")
     hooks.reset_bus_for_tests()
     assert hooks.get_bus() is None
     hooks.emit("anything")  # must not raise
@@ -193,8 +191,8 @@ def test_hooks_disabled_by_default(monkeypatch, tmp_path):
 def test_hooks_enabled_via_env(monkeypatch, tmp_path):
     from agentic_system.events import hooks
     db = str(tmp_path / "hooks.db")
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "1")
-    monkeypatch.setenv("HERMES_EVENTS_DB", db)
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "1")
+    monkeypatch.setenv("AGENTIC_EVENTS_DB", db)
     hooks.reset_bus_for_tests()
     bus = hooks.get_bus()
     assert bus is not None

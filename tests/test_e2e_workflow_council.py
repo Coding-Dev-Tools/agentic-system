@@ -22,8 +22,8 @@ from agentic_system.workflow.worker import WorkflowWorker
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     db = str(tmp_path / "e2e.db")
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "1")
-    monkeypatch.setenv("HERMES_EVENTS_DB", db)
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "1")
+    monkeypatch.setenv("AGENTIC_EVENTS_DB", db)
     orch_hooks.reset_bus_for_tests()
     reset_registry_for_tests()
     yield db

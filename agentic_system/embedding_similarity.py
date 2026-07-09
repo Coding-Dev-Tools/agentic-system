@@ -20,8 +20,6 @@ needs a ``(a, b) -> float`` callable.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from .no_progress import SimilarityFn
 
 

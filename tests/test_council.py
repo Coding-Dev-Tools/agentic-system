@@ -190,7 +190,6 @@ def test_make_engraphis_persist_hook_real_round_trip(tmp_path, monkeypatch):
     from agentic_system.council.service import make_engraphis_persist_hook
     hook = make_engraphis_persist_hook()
     # if engraphis import failed the hook degrades to a no-op lambda — skip
-    import inspect
     if hook.__name__ != "hook":
         pytest.skip("engraphis persist hook is the no-op fallback")
     ref = hook({"session_id": "council-rt", "decision": "APPROVE",

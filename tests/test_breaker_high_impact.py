@@ -23,8 +23,8 @@ from agentic_system.events import hooks as orch_hooks
 def enabled_env(tmp_path, monkeypatch):
     """Point orchestration at a throwaway DB with the flag ON."""
     db = tmp_path / "events.db"
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "1")
-    monkeypatch.setenv("HERMES_EVENTS_DB", str(db))
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "1")
+    monkeypatch.setenv("AGENTIC_EVENTS_DB", str(db))
     reset_registry_for_tests()
     orch_hooks.reset_bus_for_tests()
     yield str(db)
@@ -34,8 +34,8 @@ def enabled_env(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def disabled_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "0")
-    monkeypatch.setenv("HERMES_EVENTS_DB", str(tmp_path / "events.db"))
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "0")
+    monkeypatch.setenv("AGENTIC_EVENTS_DB", str(tmp_path / "events.db"))
     reset_registry_for_tests()
     orch_hooks.reset_bus_for_tests()
     yield

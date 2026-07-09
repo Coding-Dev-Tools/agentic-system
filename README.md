@@ -118,7 +118,7 @@ Register them as periodic jobs via `register_sweeps()` (needs a `CronPort`).
 
 ## Using with Engraphis (the companion memory engine)
 
-[Engraphis](https://github.com/) is a local-first AI memory engine. agentic-system
+[Engraphis](https://github.com/Coding-Dev-Tools/engraphis) is a local-first AI memory engine. agentic-system
 works hand-in-hand with it via a single hook — council verdicts persist to
 Engraphis as durable `council_verdict` memories (episodic, workspace-scoped) so
 they show up in recall/why/timeline alongside everything else your agent knows.

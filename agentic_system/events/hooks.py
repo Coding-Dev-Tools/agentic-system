@@ -2,14 +2,16 @@
 
 Everything here is safe to call from the conversation loop hot path:
 - ``emit()`` NEVER raises and is a no-op unless orchestration is enabled
-  (``orchestration.enabled`` in config or ``HERMES_ORCHESTRATION=1``).
+  (the ConfigPort's ``orchestration_enabled()`` -- hosts typically read
+  ``orchestration.enabled`` from their config; the test ConfigPort honours
+  ``AGENTIC_ORCHESTRATION`` with ``HERMES_ORCHESTRATION`` as a back-compat alias).
 - Config and the token-budget primitive are accessed through the adapter
-  seam in ``agent.orchestration_ports`` (ConfigPort / TokenBudgetPort), so
-  this module has NO direct dependency on ``hermes_cli.config`` or
-  ``agent.iteration_budget`` — another agent runtime can register its own
-  ports and reuse the whole layer. The default DB is <repo>/data/
-  hermes_events.db (override via ``orchestration.db_path`` or
-  ``HERMES_EVENTS_DB``).
+  seam in ``ports`` (ConfigPort / TokenBudgetPort), so this module has NO
+  direct dependency on any host's config or token-budget module -- another
+  agent runtime can register its own ports and reuse the whole layer. The
+  default DB is ``<cwd>/events.db`` when no port is registered (override via
+  the ConfigPort's ``events_db_path()``, or ``AGENTIC_EVENTS_DB`` in the test
+  ConfigPort; ``HERMES_EVENTS_DB`` accepted as a back-compat alias).
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from agentic_system.ports import (  # the host-adapter seam
     set_config_port, set_token_budget_port, reset_ports_for_tests,
 )
 
-logger = logging.getLogger("hermes.events")
+logger = logging.getLogger("agentic_system.events")
 
 _bus = None
 _bus_lock = threading.Lock()
@@ -41,7 +43,7 @@ def events_db_path() -> str:
         return get_config_port().events_db_path()
     except Exception:
         from pathlib import Path
-        return str(Path.cwd() / "hermes_events.db")
+        return str(Path.cwd() / "events.db")
 
 
 def get_bus():

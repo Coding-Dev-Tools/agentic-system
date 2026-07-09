@@ -17,7 +17,7 @@ Guards & economics:
   council_sessions and, via ``persist_hook``, to Engraphis namespace
   ``hermes-council`` (kind=council_verdict) for why/timeline audit.
 
-Config (cli-config.yaml)::
+Config (your config file)::
 
     council:
       members:
@@ -45,7 +45,7 @@ from agentic_system.council.schemas import (
 )
 from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
 
-logger = logging.getLogger("hermes.council")
+logger = logging.getLogger("agentic_system.council")
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 

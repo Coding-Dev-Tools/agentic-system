@@ -13,8 +13,8 @@ from agentic_system.events.state_tables import connect, ensure_state_tables, hea
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
     p = str(tmp_path / "events.db")
-    monkeypatch.setenv("HERMES_EVENTS_DB", p)
-    monkeypatch.setenv("HERMES_ORCHESTRATION", "1")
+    monkeypatch.setenv("AGENTIC_EVENTS_DB", p)
+    monkeypatch.setenv("AGENTIC_ORCHESTRATION", "1")
     orch_hooks.reset_bus_for_tests()
     yield p
     orch_hooks.reset_bus_for_tests()

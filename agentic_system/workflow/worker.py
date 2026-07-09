@@ -16,7 +16,7 @@ from agentic_system.events.state_tables import connect, ensure_state_tables, hea
 from agentic_system.state_machine import AgentState, AgentStateMachine
 from agentic_system.workflow.engine import WorkflowEngine
 
-logger = logging.getLogger("hermes.workflow.worker")
+logger = logging.getLogger("agentic_system.workflow.worker")
 
 # handler(task_dict) -> output_ref | None; raise to fail the task
 Handler = Callable[[dict], Optional[str]]
@@ -60,14 +60,20 @@ class WorkflowWorker:
             self.fsm.handle("reset")
             return True
         except Exception as exc:
-            logger.exception("worker %s failed task %s", self.agent_id, task["id"])
-            outcome = self.engine.fail_task(task["id"], reason=f"{type(exc).__name__}: {exc}")
+            task_id = task["id"] if task is not None else None
+            if task_id is not None:
+                logger.exception("worker %s failed task %s", self.agent_id, task_id)
+                self.engine.fail_task(task_id, reason=f"{type(exc).__name__}: {exc}")
+            else:
+                # failed before a task was claimed (e.g. claim_next raised) --
+                # nothing to requeue; just log and cool down.
+                logger.exception("worker %s failed before claiming a task", self.agent_id)
             if self.fsm.state == AgentState.EXECUTING:
                 self.fsm.handle("tool_error")
             elif self.fsm.state == AgentState.PLANNING:
                 self.fsm.handle("planning_error")
             self.fsm.handle("soft_fail")  # -> COOLDOWN; tick() releases it
-            return outcome == "requeued" or True
+            return True
         finally:
             # materialize the terminal FSM state (IDLE after reset/claim_lost,
             # COOLDOWN after a failure) so agent_instances never reports a

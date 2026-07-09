@@ -95,7 +95,33 @@ class EventStore:
             return int(cur.lastrowid)
 
     def append_many(self, events: Iterable[EventEnvelope]) -> list[int]:
-        return [self.append(e) for e in events]
+        """Append many events in ONE transaction (a single commit, not one per
+        event -- the commit is the expensive part). Returns each event's
+        monotonic ``seq``, in order."""
+        events = list(events)
+        if not events:
+            return []
+        seqs: list[int] = []
+        with self._lock:
+            for event in events:
+                if not isinstance(event, EventEnvelope):
+                    raise TypeError("append() requires an EventEnvelope")
+                cur = self._conn.execute(
+                    """INSERT INTO events (id, type, source, target, aggregate_type,
+                           aggregate_id, correlation_id, causation_id, created_at,
+                           schema_version, priority, ttl_seconds, payload_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        event.id, event.type, event.source, event.target,
+                        event.aggregate_type, event.aggregate_id,
+                        event.correlation_id, event.causation_id, event.created_at,
+                        event.schema_version, event.priority, event.ttl_seconds,
+                        json.dumps(event.payload, ensure_ascii=False, default=str),
+                    ),
+                )
+                seqs.append(int(cur.lastrowid))
+            self._conn.commit()
+        return seqs
 
     # ── reads ────────────────────────────────────────────────────────────
     def _row_to_event(self, row: sqlite3.Row) -> EventEnvelope:
@@ -152,6 +178,25 @@ class EventStore:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) AS c FROM events").fetchone()
         return int(row["c"])
+
+    def aggregate_counts_by_type(self, since_iso: str,
+                                 types: Sequence[str]) -> list[dict]:
+        """Count events grouped by ``(type, aggregate_id)`` since ``since_iso``.
+
+        Read-only aggregate for sweeps/metrics -- a public surface so callers
+        don't reach into the private ``_conn``. Returns ``[{type, aggregate_id,
+        n}, ...]``."""
+        if not types:
+            return []
+        ph = ",".join("?" * len(types))
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT type, aggregate_id, COUNT(*) AS n FROM events "
+                f"WHERE created_at >= ? AND type IN ({ph}) "
+                f"GROUP BY type, aggregate_id",
+                [since_iso, *types],
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── consumer offsets (at-least-once) ─────────────────────────────────
     def get_offset(self, consumer_name: str) -> int:

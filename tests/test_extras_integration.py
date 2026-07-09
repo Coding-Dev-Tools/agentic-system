@@ -42,7 +42,7 @@ def test_similarity_seam_can_prevent_false_trip():
 # ── [embeddings] sentence-transformer backing ──────────────────────────────
 
 def test_embedding_similarity_factory_is_lazy():
-    st = pytest.importorskip("sentence_transformers")
+    pytest.importorskip("sentence_transformers")
     from agentic_system.embedding_similarity import make_embedding_similarity
     sim = make_embedding_similarity()      # must NOT load the model yet
     assert callable(sim)

@@ -18,7 +18,7 @@ daily_consolidate  nightly   archive-then-prune old events to _archive/ (repo
 =================  ========  =====================================================
 
 CLI:  python -m cron.sweeps <heartbeat|stuck_tasks|metrics|consolidate>
-Env:  HERMES_EVENTS_DB overrides the DB path (same as agent.events.hooks).
+Env:  AGENTIC_EVENTS_DB (or HERMES_EVENTS_DB, back-compat) overrides the DB path.
 """
 
 from __future__ import annotations
@@ -37,8 +37,12 @@ from agentic_system.events.hooks import events_db_path
 from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
 from agentic_system.events.store import EventStore
 
-_HUB_ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_ARCHIVE_DIR = _HUB_ROOT / "_archive" / "hermes-events"
+
+def _default_archive_dir(db_path: str) -> Path:
+    """Archive pruned events beside the events DB -- writable regardless of how
+    the package was installed (pip vs. source), never derived from the package
+    location (which points into site-packages for a wheel and may be read-only)."""
+    return Path(db_path).resolve().parent / "_archive" / "events"
 
 
 def _iso(dt: datetime) -> str:
@@ -187,14 +191,10 @@ def metric_watchdog(db_path: Optional[str] = None,
     breakers = BreakerRegistry(db, bus=bus)
     try:
         cutoff = _cutoff(window_s)
-        rows = store._conn.execute(  # read-only aggregate over events
-            """SELECT type, aggregate_id, COUNT(*) AS n FROM events
-               WHERE created_at >= ? AND type IN
-                 ('turn.failed','turn.completed','task.failed','task.completed',
-                  'budget.token_exhausted','agent.state_changed')
-               GROUP BY type, aggregate_id""",
-            (cutoff,),
-        ).fetchall()
+        rows = store.aggregate_counts_by_type(cutoff, (
+            "turn.failed", "turn.completed", "task.failed", "task.completed",
+            "budget.token_exhausted", "agent.state_changed",
+        ))
         per_agent_failures: dict[str, int] = {}
         totals = {"failed": 0, "completed": 0, "budget_exhausted": 0}
         for r in rows:
@@ -238,7 +238,7 @@ def daily_consolidate(db_path: Optional[str] = None,
                       run_engraphis: bool = True) -> dict[str, Any]:
     db, conn, store, _ = _open_all(db_path)
     try:
-        adir = Path(archive_dir) if archive_dir else _DEFAULT_ARCHIVE_DIR
+        adir = Path(archive_dir) if archive_dir else _default_archive_dir(db)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
         archive = adir / f"events-pruned-{stamp}.jsonl"
         cutoff = _cutoff(retain_days * 86400)

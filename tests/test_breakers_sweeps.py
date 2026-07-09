@@ -1,7 +1,5 @@
 """Phase 2 tests: breaker registry + the four deterministic sweeps."""
 
-import json
-import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,7 +7,7 @@ import pytest
 from agentic_system.breakers import BreakerRegistry, GLOBAL_KEY
 from agentic_system.events.bus import EventBus
 from agentic_system.events.envelope import EventEnvelope
-from agentic_system.events.state_tables import connect, ensure_state_tables, heartbeat, now_iso
+from agentic_system.events.state_tables import connect, ensure_state_tables, heartbeat
 from agentic_system.events.store import EventStore
 from agentic_system.sweeps import (
     daily_consolidate,

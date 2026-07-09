@@ -9,8 +9,8 @@ Persisted in hermes_events.db so restarts are idempotent (handoff §6.5).
 
 Global-open side effects:
 - ``breaker.opened`` (priority=critical) on the event bus,
-- an addendum line appended to ``_cowork_ops/ALERT.md`` (existing incident
-  convention — watchdog owns the file, addenda are permitted),
+- an addendum line appended to the configured alert file (a host's incident
+  log; ``alert_path=None`` means no file is written),
 - ``should_accept_task()`` / ``allow_high_impact()`` return False, which
   workflow workers and deploy-ish tools must check before acting.
 """
@@ -19,21 +19,20 @@ from __future__ import annotations
 
 import fnmatch
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any, Optional
 
 from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
 
-logger = logging.getLogger("hermes.breakers")
+logger = logging.getLogger("agentic_system.breakers")
 
 CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
 LEVELS = ("agent", "workflow", "global")
 GLOBAL_KEY = "system"
 
 # Generic default: no alert file (a host passes alert_path=... to
-# BreakerRegistry, e.g. Hermes points at its _cowork_ops/ALERT.md).
+# BreakerRegistry, e.g. a host points it at its incident-log file).
 _DEFAULT_ALERT: Optional[str] = None
 
 # Tool-name patterns blocked when the global breaker is OPEN (handoff §3.1

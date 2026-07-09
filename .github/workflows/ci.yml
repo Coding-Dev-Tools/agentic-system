@@ -6,6 +6,38 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: Lint (syntax errors + pyflakes)
+        run: ruff check agentic_system tests examples
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Sanity-check the built artifacts
+        run: |
+          ls -1 dist/
+          python -c "import zipfile, glob, sys; w=sorted(glob.glob('dist/*.whl'))[0]; z=zipfile.ZipFile(w); bad=[n for n in z.namelist() if n.endswith('.db') or '/.git/' in n]; print('wheel:', w); sys.exit(1) if bad else print('no stray .db/.git artifacts in wheel')"
+          # ensure no build artifacts are tracked in the repo
+          test -z "$(git ls-files 'dist/*' 'dist-build/*' '*.whl' '*.tar.gz')" || { echo 'ERROR: build artifact tracked in repo'; git ls-files 'dist/*' 'dist-build/*' '*.whl' '*.tar.gz'; exit 1; }
+
   test:
     runs-on: ubuntu-latest
     strategy:

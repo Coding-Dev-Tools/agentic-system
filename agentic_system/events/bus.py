@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Any, Callable, Optional, Sequence
 
 from .envelope import EventEnvelope
 from .store import EventStore
 
-logger = logging.getLogger("hermes.events")
+logger = logging.getLogger("agentic_system.events")
 
 Handler = Callable[[EventEnvelope], None]
 

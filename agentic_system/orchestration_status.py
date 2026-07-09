@@ -7,9 +7,10 @@ One command to inspect an unattended/autonomous Hermes setup:
     python -m agentic_system.orchestration_status --json     # machine-readable
     python -m agentic_system.orchestration_status --db /path/events.db
 
-Reads ``data/hermes_events.db`` (override via ``HERMES_EVENTS_DB`` /
-``orchestration.db_path`` / ``--db``) directly -- no orchestration flag
-required, so it works against whatever an autonomous run has written. Safe
+Reads the configured events DB (override via ``AGENTIC_EVENTS_DB`` /
+``HERMES_EVENTS_DB`` (back-compat) / ``orchestration.db_path`` / ``--db``) directly
+-- no orchestration flag required, so it works against whatever an autonomous
+run has written. Safe
 to run any time: opens a read-only view, never writes, degrades cleanly on a
 missing/empty DB. Intended for headless inspection (after the fact) and for
 cron/health-checks (exit code 1 when any breaker is OPEN).
@@ -28,7 +29,9 @@ from typing import Any, Optional
 def _db_path(arg_db: Optional[str]) -> str:
     if arg_db:
         return arg_db
-    env = os.getenv("HERMES_EVENTS_DB", "").strip()
+    # AGENTIC_EVENTS_DB is the neutral override; HERMES_EVENTS_DB is a
+    # back-compat alias so existing Hermes status-CLI users aren't broken.
+    env = os.getenv("AGENTIC_EVENTS_DB", "").strip() or os.getenv("HERMES_EVENTS_DB", "").strip()
     if env:
         return env
     try:
@@ -36,8 +39,7 @@ def _db_path(arg_db: Optional[str]) -> str:
         return events_db_path()
     except Exception:
         from pathlib import Path
-        repo = Path(__file__).resolve().parents[1]
-        return str(repo / "data" / "hermes_events.db")
+        return str(Path.cwd() / "events.db")
 
 
 def _connect(db_path: str) -> Optional[sqlite3.Connection]:

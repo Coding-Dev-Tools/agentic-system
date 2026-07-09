@@ -1,11 +1,10 @@
-"""Test config: register ports so the ported orchestration tests work without
-a Hermes host.
+"""Test config: register ports so the orchestration tests work without a host.
 
-The package ships no HermesConfigPort (the host registers its own). For tests we
-register an env-reading ConfigPort that honours the same HERMES_ORCHESTRATION /
-HERMES_EVENTS_DB escape hatches the original Hermes port did, so the ported
-tests (which set those env vars via monkeypatch) run unchanged. A minimal
-TokenBudgetPort is registered too.
+The package ships no host ConfigPort (the host registers its own). For tests we
+register an env-reading ConfigPort that honours the AGENTIC_ORCHESTRATION /
+AGENTIC_EVENTS_DB escape hatches (with HERMES_* accepted as back-compat
+aliases), so the ported tests (which set those env vars via monkeypatch) run
+unchanged. A minimal TokenBudgetPort is registered too.
 """
 
 import os
@@ -17,12 +16,18 @@ from agentic_system import ports
 from agentic_system.events import hooks
 
 
+def _env_or(primary: str, alias: str) -> str:
+    """Read the ``primary`` env var, falling back to ``alias`` (back-compat)."""
+    v = os.getenv(primary, "").strip()
+    return v or os.getenv(alias, "").strip()
+
+
 class _EnvConfigPort:
     def __init__(self) -> None:
         self._cwd = Path.cwd()
 
     def orchestration_enabled(self) -> bool:
-        env = os.getenv("HERMES_ORCHESTRATION", "").strip().lower()
+        env = _env_or("AGENTIC_ORCHESTRATION", "HERMES_ORCHESTRATION").lower()
         if env in {"1", "true", "yes", "on"}:
             return True
         if env in {"0", "false", "no", "off"}:
@@ -30,7 +35,7 @@ class _EnvConfigPort:
         return False
 
     def events_db_path(self) -> str:
-        env = os.getenv("HERMES_EVENTS_DB", "").strip()
+        env = _env_or("AGENTIC_EVENTS_DB", "HERMES_EVENTS_DB")
         return env or str(self._cwd / "events.db")
 
     def council_config(self):
