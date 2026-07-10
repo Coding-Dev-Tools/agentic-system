@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 from agentic_system.events.state_tables import connect, ensure_state_tables, heartbeat
 from agentic_system.no_progress import NoProgress, NoProgressDetector
-from agentic_system.state_machine import AgentState, AgentStateMachine
+from agentic_system.state_machine import TRANSITIONS, AgentState, AgentStateMachine
 from agentic_system.workflow.engine import WorkflowEngine
 
 logger = logging.getLogger("agentic_system.workflow.worker")
@@ -86,7 +86,19 @@ class WorkflowWorker:
                 self.fsm.handle("no_progress" if isinstance(exc, NoProgress) else "tool_error")
             elif self.fsm.state == AgentState.PLANNING:
                 self.fsm.handle("planning_error")
-            self.fsm.handle("soft_fail")  # -> COOLDOWN; tick() releases it
+            elif self.fsm.state == AgentState.CLAIM_TASK:
+                # claim_next raised: nothing was claimed. soft_fail is not a
+                # legal transition from CLAIM_TASK and would raise
+                # InvalidTransition here, leaving the FSM stuck in CLAIM_TASK
+                # (can_accept_task() False forever). Return to IDLE instead.
+                self.fsm.handle("claim_lost")
+            elif self.fsm.state == AgentState.REVIEWING:
+                # complete_task raised after output was produced: drive the
+                # FSM to FAILED through its legal transitions.
+                self.fsm.handle("needs_changes")
+                self.fsm.handle("retries_exhausted")
+            if (self.fsm.state, "soft_fail") in TRANSITIONS:
+                self.fsm.handle("soft_fail")  # -> COOLDOWN; tick() releases it
             return True
         finally:
             # materialize the terminal FSM state (IDLE after reset/claim_lost,
