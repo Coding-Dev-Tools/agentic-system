@@ -27,6 +27,7 @@ Env:  AGENTIC_EVENTS_DB (or HERMES_EVENTS_DB, back-compat) overrides the DB path
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -315,7 +316,9 @@ def breaker_recovery_sweep(db_path: Optional[str] = None,
 def daily_consolidate(db_path: Optional[str] = None,
                       retain_days: float = 14.0,
                       archive_dir: Optional[str] = None,
-                      run_engraphis: bool = True) -> dict[str, Any]:
+                      run_engraphis: bool = True,
+                      engraphis_db: Optional[str] = None,
+                      engraphis_workspace: str = "default") -> dict[str, Any]:
     db, conn, store, _ = _open_all(db_path)
     try:
         adir = Path(archive_dir) if archive_dir else _default_archive_dir(db)
@@ -328,12 +331,36 @@ def daily_consolidate(db_path: Optional[str] = None,
         if run_engraphis:
             exe = shutil.which("engraphis-consolidate")
             if exe:
-                try:
-                    proc = subprocess.run([exe], capture_output=True, text=True,
-                                          timeout=600)
-                    engraphis_result = f"exit={proc.returncode}"
-                except Exception as exc:  # never fail the sweep on engraphis
-                    engraphis_result = f"error={type(exc).__name__}"
+                # Resolve the engraphis v2 DB. Default: the hermes-managed
+                # engraphis store (engraphis.db) beside the agent's config dir.
+                if not engraphis_db:
+                    home = Path.home()
+                    for cand in (
+                        os.environ.get("ENGRAPHIS_DB"),
+                        # Hermes-managed engraphis store (canonical location)
+                        home / "AppData" / "Local" / "hermes" / "engraphis"
+                        / "engraphis.db",
+                        # alongside the events DB (agentic-system repo layout)
+                        Path(db).resolve().parent.parent / "engraphis"
+                        / "engraphis.db" if db else None,
+                        home / ".engraphis" / "engraphis.db",
+                    ):
+                        if cand and Path(cand).exists():
+                            engraphis_db = str(cand)
+                            break
+                if not engraphis_db:
+                    engraphis_result = "no_db_found"
+                else:
+                    try:
+                        proc = subprocess.run(
+                            [exe, "--db", engraphis_db,
+                             "--workspace", engraphis_workspace],
+                            capture_output=True, text=True, timeout=600)
+                        engraphis_result = (
+                            "ok" if proc.returncode == 0
+                            else f"exit={proc.returncode}:{proc.stderr.strip()[:200]}")
+                    except Exception as exc:  # never fail the sweep on engraphis
+                        engraphis_result = f"error={type(exc).__name__}"
             else:
                 engraphis_result = "cli_not_found"
         return {"sweep": "consolidate", "pruned_events": pruned,
