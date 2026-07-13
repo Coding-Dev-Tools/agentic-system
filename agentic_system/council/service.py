@@ -38,7 +38,7 @@ import re
 import time
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait
 from typing import Any, Callable, Optional
 
 from agentic_system.council.schemas import (
@@ -88,11 +88,12 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 class CouncilService:
     # ── provider failure tracking ────────────────────────────────────────
-    # When a provider fails, it enters a 15-minute cooldown. During cooldown,
-    # the member is skipped and its weight is redistributed to NVIDIA members
-    # (the highest-advisor provider with dual API keys for reliability).
+    # When a provider fails or times out (>60s), it enters a 15-minute cooldown.
+    # During cooldown the member is skipped and its weight is redistributed
+    # to NVIDIA members (the dual-key highest-advisor provider).
     _COOLDOWN_SECONDS = 15 * 60  # 15 minutes
     _MAX_ATTEMPTS_PER_COOLDOWN = 2  # never a 3rd attempt within 15 min
+    _STAGE1_TIMEOUT = 60  # seconds — any member exceeding this is skipped
 
     def __init__(self, db_path: str, bus: Any = None,
                  members: Optional[list[dict]] = None,
@@ -282,9 +283,22 @@ class CouncilService:
             return None
 
         members_only = [m for m, _ in effective]
-        with ThreadPoolExecutor(max_workers=max(len(members_only), 1)) as pool:
+        with ThreadPoolExecutor(max_workers=len(members_only)) as pool:
             futs = {pool.submit(one, m): m for m in members_only}
-            for fut in as_completed(futs):
+            done, not_done = futures_wait(futs, timeout=self._STAGE1_TIMEOUT)
+
+            # Cancel & record failures for timed-out members
+            for fut in not_done:
+                member = futs[fut]
+                logger.warning(
+                    "council member %s timed out (>%ds), skipping",
+                    member.id, self._STAGE1_TIMEOUT,
+                )
+                self._record_failure(member)
+                fut.cancel()
+
+            # Collect reviews from completed members
+            for fut in done:
                 r = fut.result()
                 if r is not None:
                     reviews[r.model_id] = r
