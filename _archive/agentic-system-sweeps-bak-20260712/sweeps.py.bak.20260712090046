@@ -313,59 +313,12 @@ def breaker_recovery_sweep(db_path: Optional[str] = None,
 
 # ── 5. daily consolidate (nightly) ────────────────────────────────────────
 
-def _resolve_engraphis_db(db: Optional[str]) -> Optional[str]:
-    """Resolve the canonical engraphis v2 DB.
-
-    Order: explicit env override, then the HERMES_HOME-managed store (the live
-    singleton writer's DB), then the events-DB-adjacent repo layout, then the
-    stale AppData/.engraphis fallbacks LAST so a nightly sweep never silently
-    consolidates a frozen copy while the fleet writes elsewhere.
-    """
-    home = Path.home()
-    hermes_home = os.environ.get("HERMES_HOME")
-    cands = [
-        os.environ.get("ENGRAPHIS_DB"),
-        (Path(hermes_home) / "engraphis" / "engraphis.db") if hermes_home else None,
-        (Path(db).resolve().parent.parent / "engraphis" / "engraphis.db") if db else None,
-        # stale fallbacks last
-        home / "AppData" / "Local" / "hermes" / "engraphis" / "engraphis.db",
-        home / ".engraphis" / "engraphis.db",
-    ]
-    for cand in cands:
-        if cand and Path(cand).exists():
-            return str(cand)
-    return None
-
-
-def _engraphis_workspaces(engraphis_db: str) -> list[str]:
-    """Every non-archived workspace holding at least one live memory, biggest first."""
-    try:
-        import sqlite3
-        c = sqlite3.connect(engraphis_db, timeout=30)
-        c.execute("PRAGMA busy_timeout=30000")
-        rows = c.execute(
-            "SELECT w.name, COUNT(m.id) c FROM workspaces w "
-            "LEFT JOIN memories m ON m.workspace_id=w.id AND m.expired_at IS NULL "
-            "WHERE w.name NOT LIKE '_archived:%' "
-            "GROUP BY w.id HAVING c>0 ORDER BY c DESC").fetchall()
-        c.close()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
-
-
 def daily_consolidate(db_path: Optional[str] = None,
                       retain_days: float = 14.0,
                       archive_dir: Optional[str] = None,
                       run_engraphis: bool = True,
                       engraphis_db: Optional[str] = None,
-                      engraphis_workspace: Optional[str] = None,
-                      profiles: bool = False) -> dict[str, Any]:
-    # NOTE: profiles defaults OFF. The current entity extractor captures
-    # capitalized common words ("True", "Run", "State", "Active"...) as
-    # "person_or_concept", so --profiles would flood the store with junk
-    # profile digests. Distillation (recurring-episodic clustering) is safe
-    # and always runs; re-enable profiles only once entity extraction improves.
+                      engraphis_workspace: str = "default") -> dict[str, Any]:
     db, conn, store, _ = _open_all(db_path)
     try:
         adir = Path(archive_dir) if archive_dir else _default_archive_dir(db)
@@ -374,36 +327,42 @@ def daily_consolidate(db_path: Optional[str] = None,
         cutoff = _cutoff(retain_days * 86400)
         pruned = store.prune_before(cutoff, archive_path=str(archive))
 
-        engraphis_result: Any = "skipped"
+        engraphis_result = "skipped"
         if run_engraphis:
             exe = shutil.which("engraphis-consolidate")
-            if not exe:
-                engraphis_result = "cli_not_found"
-            else:
+            if exe:
+                # Resolve the engraphis v2 DB. Default: the hermes-managed
+                # engraphis store (engraphis.db) beside the agent's config dir.
                 if not engraphis_db:
-                    engraphis_db = _resolve_engraphis_db(db)
+                    home = Path.home()
+                    for cand in (
+                        os.environ.get("ENGRAPHIS_DB"),
+                        # Hermes-managed engraphis store (canonical location)
+                        home / "AppData" / "Local" / "hermes" / "engraphis"
+                        / "engraphis.db",
+                        # alongside the events DB (agentic-system repo layout)
+                        Path(db).resolve().parent.parent / "engraphis"
+                        / "engraphis.db" if db else None,
+                        home / ".engraphis" / "engraphis.db",
+                    ):
+                        if cand and Path(cand).exists():
+                            engraphis_db = str(cand)
+                            break
                 if not engraphis_db:
                     engraphis_result = "no_db_found"
                 else:
-                    # Consolidate every populated workspace, not just 'default'.
-                    if engraphis_workspace:
-                        targets = [engraphis_workspace]
-                    else:
-                        targets = _engraphis_workspaces(engraphis_db) or ["default"]
-                    per_ws: dict[str, str] = {}
-                    for ws in targets:
-                        cmd = [exe, "--db", engraphis_db, "--workspace", ws]
-                        if profiles:
-                            cmd.append("--profiles")
-                        try:
-                            proc = subprocess.run(
-                                cmd, capture_output=True, text=True, timeout=600)
-                            per_ws[ws] = (
-                                "ok" if proc.returncode == 0
-                                else f"exit={proc.returncode}:{proc.stderr.strip()[:120]}")
-                        except Exception as exc:  # never fail the sweep on engraphis
-                            per_ws[ws] = f"error={type(exc).__name__}"
-                    engraphis_result = {"db": engraphis_db, "workspaces": per_ws}
+                    try:
+                        proc = subprocess.run(
+                            [exe, "--db", engraphis_db,
+                             "--workspace", engraphis_workspace],
+                            capture_output=True, text=True, timeout=600)
+                        engraphis_result = (
+                            "ok" if proc.returncode == 0
+                            else f"exit={proc.returncode}:{proc.stderr.strip()[:200]}")
+                    except Exception as exc:  # never fail the sweep on engraphis
+                        engraphis_result = f"error={type(exc).__name__}"
+            else:
+                engraphis_result = "cli_not_found"
         return {"sweep": "consolidate", "pruned_events": pruned,
                 "archive": str(archive) if pruned else None,
                 "engraphis": engraphis_result}
