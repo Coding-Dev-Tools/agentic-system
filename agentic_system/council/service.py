@@ -188,7 +188,7 @@ class CouncilService:
                 # Cooldown expired — reset
                 del self._failures[key]
                 return False
-            return state["attempts"] >= self._MAX_ATTEMPTS_PER_COOLDOWN
+            return bool(state["attempts"] >= self._MAX_ATTEMPTS_PER_COOLDOWN)
 
     def _record_failure(self, member: CouncilMember):
         """Record a provider failure and increment attempt counter."""
