@@ -25,6 +25,8 @@ class CouncilMember(BaseModel):
     id: str                       # model id, e.g. "claude-sonnet-5"
     provider: Optional[str] = None
     weight: float = 1.0
+    base_url: Optional[str] = None   # for custom/OpenAI-compatible providers
+    api_key: Optional[str] = None    # paired with base_url
 
     @field_validator("weight")
     @classmethod

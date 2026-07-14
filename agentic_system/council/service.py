@@ -35,8 +35,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait
 from typing import Any, Callable, Optional
 
 from agentic_system.council.schemas import (
@@ -85,6 +87,14 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 class CouncilService:
+    # ── provider failure tracking ────────────────────────────────────────
+    # When a provider fails or times out (>60s), it enters a 15-minute cooldown.
+    # During cooldown the member is skipped and its weight is redistributed
+    # to NVIDIA members (the dual-key highest-advisor provider).
+    _COOLDOWN_SECONDS = 15 * 60  # 15 minutes
+    _MAX_ATTEMPTS_PER_COOLDOWN = 2  # never a 3rd attempt within 15 min
+    _STAGE1_TIMEOUT = 60  # seconds — any member exceeding this is skipped
+
     def __init__(self, db_path: str, bus: Any = None,
                  members: Optional[list[dict]] = None,
                  thresholds: Optional[dict] = None,
@@ -108,6 +118,9 @@ class CouncilService:
                              else (cfg_quorum if cfg_quorum is not None else 2))
         self.llm_fn = llm_fn or _default_llm_fn
         self.persist_hook = persist_hook
+        # Provider failure tracker: {provider_key: {"fails": int, "first_fail": float, "attempts": int}}
+        self._failures: dict[str, dict] = {}
+        self._failures_lock = threading.Lock()
 
     @staticmethod
     def _load_config():
@@ -156,15 +169,99 @@ class CouncilService:
         return decision
 
     # ── stage 1: parallel structured reviews ─────────────────────────────
+    def _provider_key(self, member: CouncilMember) -> str:
+        """Unique key per provider+model+key combo for failure tracking."""
+        return f"{member.provider or 'default'}:{member.id}"
+
+    def _is_nvidia(self, member: CouncilMember) -> bool:
+        return (member.provider or "").lower() == "nvidia"
+
+    def _is_in_cooldown(self, member: CouncilMember) -> bool:
+        """Check if a provider is in 15-minute cooldown (max 2 attempts)."""
+        key = self._provider_key(member)
+        with self._failures_lock:
+            state = self._failures.get(key)
+            if not state:
+                return False
+            elapsed = time.time() - state["first_fail"]
+            if elapsed >= self._COOLDOWN_SECONDS:
+                # Cooldown expired — reset
+                del self._failures[key]
+                return False
+            return bool(state["attempts"] >= self._MAX_ATTEMPTS_PER_COOLDOWN)
+
+    def _record_failure(self, member: CouncilMember):
+        """Record a provider failure and increment attempt counter."""
+        key = self._provider_key(member)
+        with self._failures_lock:
+            state = self._failures.get(key)
+            now = time.time()
+            if not state:
+                self._failures[key] = {"fails": 1, "first_fail": now, "attempts": 1}
+            else:
+                # Reset if cooldown expired
+                if now - state["first_fail"] >= self._COOLDOWN_SECONDS:
+                    self._failures[key] = {"fails": 1, "first_fail": now, "attempts": 1}
+                else:
+                    state["attempts"] += 1
+                    state["fails"] += 1
+            logger.warning("council provider %s failed (attempt %d/%d within 15 min)",
+                           key, self._failures[key]["attempts"],
+                           self._MAX_ATTEMPTS_PER_COOLDOWN)
+
+    def _record_success(self, member: CouncilMember):
+        """Clear failure state on success."""
+        key = self._provider_key(member)
+        with self._failures_lock:
+            self._failures.pop(key, None)
+
+    def _effective_members(self) -> list[tuple[CouncilMember, float]]:
+        """Return (member, effective_weight) pairs.
+
+        Members in cooldown are excluded. Their weight is redistributed
+        equally to NVIDIA members (the dual-key highest-advisor provider).
+        """
+        active = []
+        cooldown_weight = 0.0
+        for m in self.members:
+            if self._is_in_cooldown(m):
+                cooldown_weight += m.weight
+                logger.info("council: %s in cooldown, redistributing weight %.2f to NVIDIA",
+                            m.id, m.weight)
+            else:
+                active.append((m, m.weight))
+
+        # Redistribute cooldown weight to NVIDIA members
+        if cooldown_weight > 0:
+            nvidia_members = [(m, w) for m, w in active if self._is_nvidia(m)]
+            if nvidia_members:
+                bonus = cooldown_weight / len(nvidia_members)
+                active = [
+                    (m, w + bonus) if self._is_nvidia(m) else (m, w)
+                    for m, w in active
+                ]
+                logger.info("council: redistributed %.2f weight to %d NVIDIA members (+%.2f each)",
+                            cooldown_weight, len(nvidia_members), bonus)
+
+        return active
+
     def _stage1(self, request: CouncilRequest) -> dict[str, ModelReview]:
         lo, hi = request.scale_min, request.scale_max
         system = REVIEW_SYSTEM.replace("{lo}", str(lo)).replace("{hi}", str(hi))
         user = self._review_prompt(request)
         reviews: dict[str, ModelReview] = {}
 
+        effective = self._effective_members()
+        if not effective:
+            logger.error("council: all members in cooldown!")
+            return reviews
+
         def one(member: CouncilMember) -> Optional[ModelReview]:
+            # Check cooldown again right before calling (race safety)
+            if self._is_in_cooldown(member):
+                return None
             prompt = user  # per-member copy; retry appends a repair note
-            for attempt in (1, 2):  # one repair retry
+            for attempt in (1, 2):  # one repair retry (max 2 attempts)
                 try:
                     raw = self.llm_fn(member, system, prompt)
                     data = _extract_json(raw)
@@ -173,18 +270,35 @@ class CouncilService:
                     missing = set(request.rubric_dimensions) - set(review.self_scores)
                     if missing:
                         raise ValueError(f"missing rubric dimensions: {missing}")
+                    self._record_success(member)
                     return review
                 except Exception as exc:
-                    logger.warning("council member %s attempt %d invalid: %s",
+                    logger.warning("council member %s attempt %d failed: %s",
                                    member.id, attempt, exc)
-                    if attempt == 1:
+                    if attempt == 2:
+                        self._record_failure(member)
+                    else:
                         prompt = user + "\n\nYour previous reply was invalid " \
                                         f"({exc}). Return ONLY the JSON object."
             return None
 
-        with ThreadPoolExecutor(max_workers=max(len(self.members), 1)) as pool:
-            futs = {pool.submit(one, m): m for m in self.members}
-            for fut in as_completed(futs):
+        members_only = [m for m, _ in effective]
+        with ThreadPoolExecutor(max_workers=len(members_only)) as pool:
+            futs = {pool.submit(one, m): m for m in members_only}
+            done, not_done = futures_wait(futs, timeout=self._STAGE1_TIMEOUT)
+
+            # Cancel & record failures for timed-out members
+            for fut in not_done:
+                member = futs[fut]
+                logger.warning(
+                    "council member %s timed out (>%ds), skipping",
+                    member.id, self._STAGE1_TIMEOUT,
+                )
+                self._record_failure(member)
+                fut.cancel()
+
+            # Collect reviews from completed members
+            for fut in done:
                 r = fut.result()
                 if r is not None:
                     reviews[r.model_id] = r
