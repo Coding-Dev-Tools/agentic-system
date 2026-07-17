@@ -1,1 +1,2 @@
-# Marker file for PEP 561: package ships inline type hints.
+# Marker file for PEP 561 (py.typed)
+# This package supports typing

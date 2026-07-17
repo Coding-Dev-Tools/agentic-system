@@ -1,501 +1,259 @@
-"""Deterministic orchestration sweeps -- no LLM involvement.
+"""Periodic sweeps: heartbeat / stuck-task recovery / metric watchdog / nightly consolidate.
 
-Five sweeps, designed to run as ``no_agent=True`` script cron jobs (the
-scheduler's script runner) or from any process:
+Register with the host's CronPort at startup::
 
-=================  ========  =====================================================
-sweep              cadence   action
-=================  ========  =====================================================
-heartbeat_sweep    1 min     stale agent heartbeats -> AgentUnresponsive, CAS
-                             their ASSIGNED tasks back to PENDING
-stuck_task_sweep   5 min     ASSIGNED/WAITING_DEP tasks past threshold ->
-                             requeue (attempts++) or escalate to council/manager
-metric_watchdog    10 min    failure ratios + budget exhaustion counts from the
-                             event store -> trip agent/global breakers
-breaker_recovery   2 min     self-heal tripped breakers: OPEN -> HALF_OPEN
-                             after a cooldown; HALF_OPEN -> CLOSED on a clean
-                             probe window (or re-OPEN if failures continue)
-daily_consolidate  nightly   archive-then-prune old events to _archive/ (repo
-                             deletion policy); optionally run engraphis
-                             consolidation CLI when installed
-=================  ========  =====================================================
+    from agentic_system.sweeps import register_sweeps
+    register_sweeps()
 
-CLI:  python -m agentic_system.sweeps <heartbeat|stuck_tasks|metrics|breaker_recovery|consolidate|register>
-Env:  AGENTIC_EVENTS_DB (or HERMES_EVENTS_DB, back-compat) overrides the DB path.
+The host CronPort provides ``scripts_dir()``, ``list_job_names()``, and
+``create_job(name, schedule, script, workdir)``. Each sweep is a small
+script (shipped in the package) invoked on a cron schedule.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import subprocess
-import sys
-from datetime import datetime, timedelta, timezone
+import importlib.resources
+import logging
+import textwrap
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
-from agentic_system.breakers import BreakerRegistry, GLOBAL_KEY, HALF_OPEN, OPEN
-from agentic_system.events.bus import EventBus
-from agentic_system.events.hooks import events_db_path
-from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
-from agentic_system.events.store import EventStore
+from agentic_system.ports import get_config_port, get_cron_port
 
+logger = logging.getLogger("agentic_system.sweeps")
 
-def _default_archive_dir(db_path: str) -> Path:
-    """Archive pruned events beside the events DB -- writable regardless of how
-    the package was installed (pip vs. source), never derived from the package
-    location (which points into site-packages for a wheel and may be read-only)."""
-    return Path(db_path).resolve().parent / "_archive" / "events"
+# ── Sweep definitions ────────────────────────────────────────────────────
 
+SWEEPS = {
+    "heartbeat": {
+        "schedule": "*/5 * * * *",          # every 5 minutes
+        "description": "verify agent liveness + write work-log entry",
+        "script": "heartbeat.py",
+    },
+    "stuck_task_recovery": {
+        "schedule": "*/10 * * * *",         # every 10 minutes
+        "description": "re-queue workflow tasks stuck > threshold",
+        "script": "stuck_task_recovery.py",
+    },
+    "metric_watchdog": {
+        "schedule": "*/5 * * * *",          # every 5 minutes
+        "description": "alert on breaker OPEN, queue depth, error rates",
+        "script": "metric_watchdog.py",
+    },
+    "nightly_consolidate": {
+        "schedule": "0 3 * * *",            # 3 AM daily
+        "description": "prune old events, archive to JSONL, vacuum DB",
+        "script": "nightly_consolidate.py",
+    },
+}
 
-def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+# ── Built-in sweep scripts (embedded; written to scripts_dir on first register) ──
 
+HEARTBEAT_SCRIPT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    \"\"\"Heartbeat sweep: verify agent liveness + write work-log entry.\"\"\"
+    import sys, json, os, datetime, sqlite3
+    from pathlib import Path
 
-def _cutoff(seconds: float) -> str:
-    return _iso(datetime.now(timezone.utc) - timedelta(seconds=seconds))
+    HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    DB = HERMES_HOME / "state.db"
 
+    def main():
+        now = datetime.datetime.utcnow().isoformat() + "Z"
+        ok = True
+        details = {}
+        # 1. Check state.db has recent agent activity
+        try:
+            conn = sqlite3.connect(DB)
+            row = conn.execute(
+                "SELECT MAX(ts) FROM events WHERE type LIKE 'agent.%'"
+            ).fetchone()
+            if row and row[0]:
+                from datetime import datetime
+                last = datetime.fromisoformat(row[0].replace('Z', '+00:00'))
+                delta = (datetime.utcnow() - last).total_seconds()
+                details["last_agent_event_sec"] = delta
+                if delta > 300:  # 5 min
+                    ok = False
+                    details["reason"] = "no agent activity > 5 min"
+        except Exception as e:
+            ok = False
+            details["db_error"] = str(e)
+        # 2. Write work-log
+        log = HERMES_HOME / "cron" / "work-log.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(json.dumps({
+            "ts": now, "job": "heartbeat",
+            "did": "heartbeat check", "outcome": "ok" if ok else "degraded",
+            "next": "continue", **details
+        }) + "\\n", encoding="utf-8")
+        sys.exit(0 if ok else 1)
 
-def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
-    """Parse an ISO-8601 timestamp produced by ``now_iso``/``_iso`` (trailing
-    ``Z``). Returns None on a missing/blank value; raises never (None in -> None
-    out) so callers can fall back to "treat as unknown/not-yet"."""
-    if not ts:
-        return None
-    s = ts.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        return datetime.fromisoformat(s)
-    except ValueError:
-        return None
+    if __name__ == "__main__": main()
+""")
 
+STUCK_TASK_RECOVERY_SCRIPT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    \"\"\"Stuck-task recovery: find workflows/tasks stuck > threshold and re-queue.\"\"\"
+    import sys, os, json, sqlite3, datetime
+    from pathlib import Path
 
-def _open_all(db_path: Optional[str]):
-    db = db_path or events_db_path()
-    conn = connect(db)
-    ensure_state_tables(conn)
-    store = EventStore(db)
-    return db, conn, store, EventBus(store, source="sweeps")
+    HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    DB = HERMES_HOME / "state.db"
+    THRESHOLD_MIN = int(os.environ.get("STUCK_THRESHOLD_MIN", "30"))
 
-
-# ── 1. heartbeat sweep (1 min) ────────────────────────────────────────────
-
-def heartbeat_sweep(db_path: Optional[str] = None,
-                    stale_after_s: float = 120.0) -> dict[str, Any]:
-    _, conn, store, bus = _open_all(db_path)
-    try:
-        cutoff = _cutoff(stale_after_s)
-        stale = conn.execute(
-            """SELECT id FROM agent_instances
-               WHERE status NOT IN ('UNRESPONSIVE','RETIRED')
-                 AND (last_heartbeat_at IS NULL OR last_heartbeat_at < ?)""",
-            (cutoff,),
+    def main():
+        conn = sqlite3.connect(DB)
+        conn.row_factory = sqlite3.Row
+        now = datetime.datetime.utcnow()
+        recovered = 0
+        rows = conn.execute(
+            "SELECT instance_id, workflow_name, claimed_by, claim_ts "
+            "FROM workflow_instances WHERE state='RUNNING' AND claim_ts IS NOT NULL"
         ).fetchall()
-        requeued: list[str] = []
-        pending_events = []  # published AFTER commit — a second connection
-        # writing mid-transaction would deadlock on the SQLite write lock.
-        for row in stale:
-            agent_id = row["id"]
-            conn.execute(
-                "UPDATE agent_instances SET status='UNRESPONSIVE', updated_at=? WHERE id=?",
-                (now_iso(), agent_id),
-            )
-            pending_events.append((
-                "agent.unresponsive", {"agent_id": agent_id, "cutoff": cutoff},
-                dict(aggregate_type="Agent", aggregate_id=agent_id, priority="high"),
-            ))
-            # CAS the vanished agent's tasks back to the queue
-            tasks = conn.execute(
-                "SELECT id FROM tasks WHERE assigned_agent_id=? AND status='ASSIGNED'",
-                (agent_id,),
-            ).fetchall()
-            for t in tasks:
-                cur = conn.execute(
-                    """UPDATE tasks SET status='PENDING', assigned_agent_id=NULL,
-                           updated_at=? WHERE id=? AND status='ASSIGNED'""",
-                    (now_iso(), t["id"]),
-                )
-                if cur.rowcount:
-                    requeued.append(t["id"])
-                    pending_events.append((
-                        "task.requeued",
-                        {"task_id": t["id"], "reason": "agent_unresponsive",
-                         "agent_id": agent_id},
-                        dict(aggregate_type="Task", aggregate_id=t["id"]),
-                    ))
-        conn.commit()
-        for etype, payload, kw in pending_events:
-            bus.publish(etype, payload, **kw)
-        return {"sweep": "heartbeat", "stale_agents": [r["id"] for r in stale],
-                "requeued_tasks": requeued}
-    finally:
-        conn.close(); store.close()
-
-
-# ── 2. stuck task sweep (5 min) ───────────────────────────────────────────
-
-def stuck_task_sweep(db_path: Optional[str] = None,
-                     assigned_stale_s: float = 900.0,
-                     waiting_stale_s: float = 3600.0) -> dict[str, Any]:
-    _, conn, store, bus = _open_all(db_path)
-    try:
-        requeued, escalated, failed = [], [], []
-        pending_events = []  # published AFTER commit (SQLite write-lock)
-        for row in conn.execute(
-            "SELECT * FROM tasks WHERE status='ASSIGNED' AND updated_at < ?",
-            (_cutoff(assigned_stale_s),),
-        ).fetchall():
-            attempts = row["attempts"] + 1
-            if attempts >= row["max_attempts"]:
-                conn.execute(
-                    "UPDATE tasks SET status='FAILED', attempts=?, updated_at=? "
-                    "WHERE id=? AND status='ASSIGNED'",
-                    (attempts, now_iso(), row["id"]),
-                )
-                failed.append(row["id"])
-                pending_events.append((
-                    "task.failed",
-                    {"task_id": row["id"], "reason": "stuck_retries_exhausted",
-                     "attempts": attempts},
-                    dict(aggregate_type="Task", aggregate_id=row["id"],
-                         correlation_id=row["workflow_run_id"], priority="high"),
-                ))
-            else:
-                conn.execute(
-                    """UPDATE tasks SET status='PENDING', assigned_agent_id=NULL,
-                           attempts=?, updated_at=? WHERE id=? AND status='ASSIGNED'""",
-                    (attempts, now_iso(), row["id"]),
-                )
-                requeued.append(row["id"])
-                pending_events.append((
-                    "task.requeued",
-                    {"task_id": row["id"], "reason": "assigned_stale",
-                     "attempts": attempts},
-                    dict(aggregate_type="Task", aggregate_id=row["id"],
-                         correlation_id=row["workflow_run_id"]),
-                ))
-        for row in conn.execute(
-            "SELECT * FROM tasks WHERE status='WAITING_DEP' AND updated_at < ?",
-            (_cutoff(waiting_stale_s),),
-        ).fetchall():
-            escalated.append(row["id"])
-            pending_events.append((
-                "task.escalated",
-                {"task_id": row["id"], "reason": "waiting_dep_stale",
-                 "node_id": row["node_id"]},
-                dict(aggregate_type="Task", aggregate_id=row["id"],
-                     correlation_id=row["workflow_run_id"], priority="high"),
-            ))
-        conn.commit()
-        for etype, payload, kw in pending_events:
-            bus.publish(etype, payload, **kw)
-        return {"sweep": "stuck_tasks", "requeued": requeued,
-                "escalated": escalated, "failed": failed}
-    finally:
-        conn.close(); store.close()
-
-
-# ── 3. metric watchdog (10 min) ───────────────────────────────────────────
-
-def metric_watchdog(db_path: Optional[str] = None,
-                    window_s: float = 600.0,
-                    agent_error_threshold: int = 5,
-                    global_fail_ratio: float = 0.5,
-                    global_min_events: int = 10,
-                    budget_exhaustion_threshold: int = 3) -> dict[str, Any]:
-    """Trip breakers from event-store metrics. Deterministic, idempotent."""
-    db, conn, store, bus = _open_all(db_path)
-    breakers = BreakerRegistry(db, bus=bus)
-    try:
-        cutoff = _cutoff(window_s)
-        rows = store.aggregate_counts_by_type(cutoff, (
-            "turn.failed", "turn.completed", "task.failed", "task.completed",
-            "budget.token_exhausted", "agent.state_changed",
-        ))
-        per_agent_failures: dict[str, int] = {}
-        totals = {"failed": 0, "completed": 0, "budget_exhausted": 0}
         for r in rows:
-            t, agg, n = r["type"], r["aggregate_id"] or "?", int(r["n"])
-            if t in ("turn.failed", "task.failed"):
-                totals["failed"] += n
-                per_agent_failures[agg] = per_agent_failures.get(agg, 0) + n
-            elif t in ("turn.completed", "task.completed"):
-                totals["completed"] += n
-            elif t == "budget.token_exhausted":
-                totals["budget_exhausted"] += n
+            claim_ts = datetime.datetime.fromisoformat(r["claim_ts"].replace('Z', '+00:00'))
+            delta = (now - claim_ts).total_seconds() / 60
+            if delta > THRESHOLD_MIN:
+                conn.execute(
+                    "UPDATE workflow_instances SET state='PENDING', claimed_by=NULL, claim_ts=NULL, "
+                    "updated_at=? WHERE instance_id=?",
+                    (datetime.datetime.utcnow().isoformat() + "Z", r["instance_id"]))
+                conn.execute(
+                    "UPDATE workflow_claims SET outcome='TIMEOUT', result_json='{}' "
+                    "WHERE instance_id=? AND claimed_by=?",
+                    (r["instance_id"], r["claimed_by"]))
+                recovered += 1
+                print(f"Recovered {r['instance_id']} (stuck {delta:.1f} min)")
+        conn.commit()
+        log = HERMES_HOME / "cron" / "work-log.jsonl"
+        log.write_text(json.dumps({
+            "ts": now.isoformat() + "Z", "job": "stuck_task_recovery",
+            "did": f"recovered {recovered} stuck workflows", "outcome": "ok",
+            "next": "continue"
+        }) + "\\n", encoding="utf-8")
+        print(f"Recovered {recovered} tasks")
 
-        tripped = []
-        for agent_id, n in per_agent_failures.items():
-            if n >= agent_error_threshold and not breakers.is_open("agent", agent_id):
-                breakers.open("agent", agent_id,
-                              f"{n} failures in {int(window_s)}s window")
-                tripped.append(("agent", agent_id))
+    if __name__ == "__main__": main()
+""")
 
-        total = totals["failed"] + totals["completed"]
-        ratio = (totals["failed"] / total) if total else 0.0
-        if (total >= global_min_events and ratio >= global_fail_ratio) or \
-           totals["budget_exhausted"] >= budget_exhaustion_threshold:
-            if not breakers.is_open("global", GLOBAL_KEY):
-                breakers.open("global", GLOBAL_KEY,
-                              f"fail_ratio={ratio:.2f} over {total} events, "
-                              f"budget_exhaustions={totals['budget_exhausted']} "
-                              f"in {int(window_s)}s")
-                tripped.append(("global", GLOBAL_KEY))
-        return {"sweep": "metrics", "window_s": window_s, "totals": totals,
-                "fail_ratio": round(ratio, 3), "tripped": tripped}
-    finally:
-        breakers.close_conn(); conn.close(); store.close()
+METRIC_WATCHDOG_SCRIPT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    \"\"\"Metric watchdog: alert on breaker OPEN, queue depth, error rates.\"\"\"
+    import sys, os, json, sqlite3, datetime
+    from pathlib import Path
 
+    HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    DB = HERMES_HOME / "state.db"
 
-# ── 4. breaker recovery sweep (2 min) ────────────────────────────────
+    def main():
+        conn = sqlite3.connect(DB)
+        conn.row_factory = sqlite3.Row
+        alerts = []
+        # 1. Global breaker OPEN?
+        row = conn.execute(
+            "SELECT 1 FROM breakers WHERE level='global' AND key='system' AND state='OPEN'"
+        ).fetchone()
+        if row:
+            alerts.append("GLOBAL_CIRCUIT_BREAKER_OPEN")
+        # 2. High-priority queue depth (events with priority='high' in last 5 min)
+        since = (datetime.datetime.utcnow() - datetime.timedelta(minutes=5)).isoformat() + "Z"
+        row = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE priority IN ('high','critical') AND ts >= ?",
+            (since,)).fetchone()
+        if row and row[0] > 50:
+            alerts.append(f"HIGH_PRIORITY_EVENT_SPIKE:{row[0]}")
+        # 3. Error rate
+        row = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE type LIKE '%error%' AND ts >= ?",
+            (since,)).fetchone()
+        if row and row[0] > 10:
+            alerts.append(f"ERROR_RATE_SPIKE:{row[0]}")
 
-def breaker_recovery_sweep(db_path: Optional[str] = None,
-                            open_cooldown_s: float = 300.0,
-                            half_open_probe_s: float = 120.0) -> dict[str, Any]:
-    """Self-heal the circuit breakers the metric watchdog trips.
+        if alerts:
+            alert_file = HERMES_HOME / "ALERT.md"
+            with open(alert_file, "a", encoding="utf-8") as f:
+                for a in alerts:
+                    f.write(f"\\n[{datetime.datetime.utcnow().isoformat()}Z] WATCHDOG: {a}\\n")
+        print(json.dumps({"alerts": alerts}))
 
-    Without this sweep, a tripped breaker stays OPEN forever (only a manual
-    ``BreakerRegistry.close()`` recovers it) -- which defeats the point of an
-    *autonomous* orchestration layer. Recovery is deterministic and idempotent:
+    if __name__ == "__main__": main()
+""")
 
-    - OPEN -> HALF_OPEN once ``opened_at`` is older than ``open_cooldown_s``
-      (probation: limited traffic is allowed again).
-    - HALF_OPEN -> CLOSED if no new failure events for the breaker's aggregate
-      arrived in the ``half_open_probe_s`` window (clean probe); otherwise
-      HALF_OPEN -> re-OPEN (the problem is still happening).
+NIGHTLY_CONSOLIDATE_SCRIPT = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    \"\"\"Nightly consolidate: prune old events, archive to JSONL, vacuum DB.\"\"\"
+    import sys, os, json, sqlite3, datetime, shutil
+    from pathlib import Path
 
-    Failure events counted::
+    HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    DB = HERMES_HOME / "state.db"
+    ARCHIVE_DIR = HERMES_HOME / "archive"
+    RETENTION_DAYS = int(os.environ.get("EVENT_RETENTION_DAYS", "30"))
 
-        turn.failed, task.failed, workflow.run_failed
+    def main():
+        ARCHIVE_DIR.mkdir(exist_ok=True)
+        today = datetime.datetime.utcnow().date()
+        cutoff = (today - datetime.timedelta(days=RETENTION_DAYS)).isoformat()
+        conn = sqlite3.connect(DB)
+        conn.row_factory = sqlite3.Row
+        # Archive old events
+        rows = conn.execute(
+            "SELECT * FROM events WHERE ts < ? ORDER BY ts", (cutoff,)).fetchall()
+        if rows:
+            archive_file = ARCHIVE_DIR / f"events_{cutoff}.jsonl"
+            with open(archive_file, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(dict(r)) + "\\n")
+            # Delete archived
+            conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+            conn.commit()
+            print(f"Archived {len(rows)} events to {archive_file}")
+        # Vacuum
+        conn.execute("VACUUM")
+        conn.close()
 
-    For non-global breakers, only events whose ``aggregate_id`` equals the
-    breaker key count (mirrors how ``metric_watchdog`` attributes failures).
-    """
-    db, conn, store, bus = _open_all(db_path)
-    breakers = BreakerRegistry(db, bus=bus)
-    try:
-        now = datetime.now(timezone.utc)
-        moved_half: list[tuple[str, str]] = []
-        closed: list[tuple[str, str]] = []
-        reopened: list[tuple[str, str]] = []
-        fail_types = ("turn.failed", "task.failed", "workflow.run_failed")
-        for row in breakers.snapshot():
-            level, key, state = row["level"], row["key"], row["state"]
-            if state == OPEN:
-                opened_at = _parse_iso(row.get("opened_at"))
-                if opened_at and (now - opened_at).total_seconds() >= open_cooldown_s:
-                    breakers.half_open(level, key, reason="probation_after_cooldown")
-                    moved_half.append((level, key))
-            elif state == HALF_OPEN:
-                half_at = _parse_iso(row.get("half_open_at"))
-                if not half_at or (now - half_at).total_seconds() < half_open_probe_s:
-                    continue
-                probe_since = _iso(now - timedelta(seconds=half_open_probe_s))
-                fails = 0
-                for c in store.aggregate_counts_by_type(probe_since, fail_types):
-                    if level == "global" or (c.get("aggregate_id") or "") == key:
-                        fails += int(c["n"])
-                if fails > 0:
-                    breakers.open(level, key,
-                                  reason=f"reopened: {fails} failures in probe")
-                    reopened.append((level, key))
-                else:
-                    breakers.close(level, key, reason="clean_probe_window")
-                    closed.append((level, key))
-        return {"sweep": "breaker_recovery",
-                "moved_to_half_open": moved_half, "closed": closed,
-                "reopened": reopened}
-    finally:
-        breakers.close_conn(); conn.close(); store.close()
+    if __name__ == "__main__": main()
+""")
 
-
-# ── 5. daily consolidate (nightly) ────────────────────────────────────────
-
-def _resolve_engraphis_db(db: Optional[str]) -> Optional[str]:
-    """Resolve the canonical engraphis v2 DB.
-
-    Order: explicit env override, then the HERMES_HOME-managed store (the live
-    singleton writer's DB), then the events-DB-adjacent repo layout, then the
-    stale AppData/.engraphis fallbacks LAST so a nightly sweep never silently
-    consolidates a frozen copy while the fleet writes elsewhere.
-    """
-    home = Path.home()
-    hermes_home = os.environ.get("HERMES_HOME")
-    cands = [
-        os.environ.get("ENGRAPHIS_DB"),
-        (Path(hermes_home) / "engraphis" / "engraphis.db") if hermes_home else None,
-        (Path(db).resolve().parent.parent / "engraphis" / "engraphis.db") if db else None,
-        # stale fallbacks last
-        home / "AppData" / "Local" / "hermes" / "engraphis" / "engraphis.db",
-        home / ".engraphis" / "engraphis.db",
-    ]
-    for cand in cands:
-        if cand and Path(cand).exists():
-            return str(cand)
-    return None
-
-
-def _engraphis_workspaces(engraphis_db: str) -> list[str]:
-    """Every non-archived workspace holding at least one live memory, biggest first."""
-    try:
-        import sqlite3
-        c = sqlite3.connect(engraphis_db, timeout=30)
-        c.execute("PRAGMA busy_timeout=30000")
-        rows = c.execute(
-            "SELECT w.name, COUNT(m.id) c FROM workspaces w "
-            "LEFT JOIN memories m ON m.workspace_id=w.id AND m.expired_at IS NULL "
-            "WHERE w.name NOT LIKE '_archived:%' "
-            "GROUP BY w.id HAVING c>0 ORDER BY c DESC").fetchall()
-        c.close()
-        return [r[0] for r in rows]
-    except Exception:
-        return []
-
-
-def daily_consolidate(db_path: Optional[str] = None,
-                      retain_days: float = 14.0,
-                      archive_dir: Optional[str] = None,
-                      run_engraphis: bool = True,
-                      engraphis_db: Optional[str] = None,
-                      engraphis_workspace: Optional[str] = None,
-                      profiles: bool = False) -> dict[str, Any]:
-    # NOTE: profiles defaults OFF. The current entity extractor captures
-    # capitalized common words ("True", "Run", "State", "Active"...) as
-    # "person_or_concept", so --profiles would flood the store with junk
-    # profile digests. Distillation (recurring-episodic clustering) is safe
-    # and always runs; re-enable profiles only once entity extraction improves.
-    db, conn, store, _ = _open_all(db_path)
-    try:
-        adir = Path(archive_dir) if archive_dir else _default_archive_dir(db)
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-        archive = adir / f"events-pruned-{stamp}.jsonl"
-        cutoff = _cutoff(retain_days * 86400)
-        pruned = store.prune_before(cutoff, archive_path=str(archive))
-
-        engraphis_result: Any = "skipped"
-        if run_engraphis:
-            exe = shutil.which("engraphis-consolidate")
-            if not exe:
-                engraphis_result = "cli_not_found"
-            else:
-                if not engraphis_db:
-                    engraphis_db = _resolve_engraphis_db(db)
-                if not engraphis_db:
-                    engraphis_result = "no_db_found"
-                else:
-                    # Consolidate every populated workspace, not just 'default'.
-                    if engraphis_workspace:
-                        targets = [engraphis_workspace]
-                    else:
-                        targets = _engraphis_workspaces(engraphis_db) or ["default"]
-                    per_ws: dict[str, str] = {}
-                    for ws in targets:
-                        cmd = [exe, "--db", engraphis_db, "--workspace", ws]
-                        if profiles:
-                            cmd.append("--profiles")
-                        try:
-                            proc = subprocess.run(
-                                cmd, capture_output=True, text=True, timeout=600)
-                            per_ws[ws] = (
-                                "ok" if proc.returncode == 0
-                                else f"exit={proc.returncode}:{proc.stderr.strip()[:120]}")
-                        except Exception as exc:  # never fail the sweep on engraphis
-                            per_ws[ws] = f"error={type(exc).__name__}"
-                    engraphis_result = {"db": engraphis_db, "workspaces": per_ws}
-        return {"sweep": "consolidate", "pruned_events": pruned,
-                "archive": str(archive) if pruned else None,
-                "engraphis": engraphis_result}
-    finally:
-        conn.close(); store.close()
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────
-
-_SWEEPS: dict[str, Callable[[], Any]] = {
-    "heartbeat": heartbeat_sweep,
-    "stuck_tasks": stuck_task_sweep,
-    "metrics": metric_watchdog,
-    "breaker_recovery": breaker_recovery_sweep,
-    "consolidate": daily_consolidate,
-}
-
-# schedule expressions for ensure_sweep_jobs / manual cron registration
-SWEEP_SCHEDULES = {
-    "heartbeat": "*/1 * * * *",
-    "stuck_tasks": "*/5 * * * *",
-    "metrics": "*/10 * * * *",
-    "breaker_recovery": "*/2 * * * *",
-    "consolidate": "0 3 * * *",
+SCRIPTS = {
+    "heartbeat.py": HEARTBEAT_SCRIPT,
+    "stuck_task_recovery.py": STUCK_TASK_RECOVERY_SCRIPT,
+    "metric_watchdog.py": METRIC_WATCHDOG_SCRIPT,
+    "nightly_consolidate.py": NIGHTLY_CONSOLIDATE_SCRIPT,
 }
 
 
-def register_sweeps(dry_run: bool = False) -> dict[str, Any]:
-    """Idempotently register the orchestration sweeps as cron jobs via
-    the host's CronPort.
-
-    Writes a small ``.py`` wrapper per sweep into the CronPort's ``scripts_dir``
-    and creates the job via ``create_job``. Existing jobs with the same name
-    are left untouched (wrappers still refreshed), so this is safe to re-run.
-    Each wrapper bakes in this package's repo root so ``agentic_system.sweeps``
-    stays importable regardless of how the host installed it.
-
-    Requires a CronPort to be registered (``set_cron_port``). ``dry_run=True``
-    reports what would be written/created without touching the filesystem.
-    """
-    from agentic_system.ports import get_cron_port
-    try:
-        cron = get_cron_port()
-    except Exception as e:
-        return {"ok": False, "error": f"no CronPort registered: {e}"}
+def register_sweeps() -> None:
+    """Write sweep scripts to host's scripts_dir and register via CronPort."""
+    cron = get_cron_port()
     scripts_dir = Path(cron.scripts_dir())
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write scripts
+    for name, content in SCRIPTS.items():
+        path = scripts_dir / name
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
+            # Make executable on Unix
+            try:
+                path.chmod(0o755)
+            except Exception:
+                pass
+
+    # Register cron jobs
     existing = set(cron.list_job_names())
-    # repo root = the directory containing this package (one level up).
-    repo_root = Path(__file__).resolve().parents[1]
-    created, skipped, scripts = [], [], []
-    for sweep, sched in SWEEP_SCHEDULES.items():
-        name = f"sweep-{sweep}"
-        script_name = f"{name}.py"
-        script_path = scripts_dir / script_name
-        wrapper = (
-            "#!/usr/bin/env python3\n"
-            "import sys\n"
-            f"sys.path.insert(0, r'{repo_root}')\n"
-            "from agentic_system.sweeps import main\n"
-            f"raise SystemExit(main([{sweep!r}]))\n"
-        )
-        if name in existing:
-            skipped.append(name)
-            if not dry_run:
-                scripts_dir.mkdir(parents=True, exist_ok=True)
-                script_path.write_text(wrapper, encoding="utf-8")
-            continue
-        scripts.append(str(script_path))
-        if dry_run:
-            continue
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        script_path.write_text(wrapper, encoding="utf-8")
-        cron.create_job(name=name, schedule=sched, script=script_name,
-                        workdir=str(repo_root))
-        created.append(name)
-    return {"ok": True, "created": created, "skipped": skipped,
-            "scripts": scripts, "dry_run": dry_run,
-            "schedules": dict(SWEEP_SCHEDULES)}
+    for name, cfg in SWEEPS.items():
+        if name not in existing:
+            cron.create_job(
+                name=name,
+                schedule=cfg["schedule"],
+                script=cfg["script"],
+                workdir=str(scripts_dir),
+            )
+            logger.info("registered sweep: %s (%s)", name, cfg["schedule"])
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
-    if not args or args[0] not in _SWEEPS:
-        if args and args[0] == "register":
-            print(json.dumps(register_sweeps(), ensure_ascii=False, indent=2))
-            return 0
-        print(f"usage: python -m agentic_system.sweeps <{'|'.join(_SWEEPS)}|register>", file=sys.stderr)
-        return 2
-    result = _SWEEPS[args[0]]()
-    print(json.dumps(result, ensure_ascii=False))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def unregister_sweeps() -> None:
+    """Remove sweep cron jobs (not implemented - CronPort has no delete)."""
+    pass

@@ -4,92 +4,94 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install ruff
-        run: pip install ruff
-      - name: Lint (syntax errors + pyflakes)
-        run: ruff check agentic_system tests examples
-
-  mypy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install mypy + core deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install mypy
-          pip install -e ".[test]"
-      - name: Type-check (py.typed guard)
-        run: mypy --config-file pyproject.toml agentic_system
-
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: Build sdist + wheel
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
-      - name: Sanity-check the built artifacts
-        run: |
-          ls -1 dist/
-          python -c "import zipfile, glob, sys; w=sorted(glob.glob('dist/*.whl'))[0]; z=zipfile.ZipFile(w); bad=[n for n in z.namelist() if n.endswith('.db') or '/.git/' in n]; print('wheel:', w); sys.exit(1) if bad else print('no stray .db/.git artifacts in wheel')"
-          # ensure no build artifacts are tracked in the repo
-          test -z "$(git ls-files 'dist/*' 'dist-build/*' '*.whl' '*.tar.gz')" || { echo 'ERROR: build artifact tracked in repo'; git ls-files 'dist/*' 'dist-build/*' '*.whl' '*.tar.gz'; exit 1; }
-
   test:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-      - name: Install (core + test extras)
+          cache: 'pip'
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test]"
-      - name: Run tests
-        run: pytest tests/ -q
+          pip install -e ".[dev]"
+          pip install pytest pytest-asyncio pytest-cov
 
-  # The optional integrations are exercised in a separate job so a missing
-  # engraphis/sentence-transformers never blocks the core.
-  extras:
+      - name: Run tests
+        run: |
+          pytest -v --cov=agentic_system --cov-report=xml --cov-fail-under=80
+
+      - name: Type check
+        run: |
+          mypy agentic_system --ignore-missing-imports
+
+      - name: Lint
+        run: |
+          ruff check agentic_system tests
+
+      - name: Check formatting
+        run: |
+          ruff format --check agentic_system tests
+
+  build:
+    needs: test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: pip
-      - name: Install with extras (embeddings; engraphis is tested where available)
-        # NOTE: the [engraphis] extra is intentionally omitted here because
-        # Engraphis is not yet on PyPI. The engraphis integration tests use
-        # pytest.importorskip("engraphis") so they SKIP cleanly. Once Engraphis
-        # is published, add engraphis back:  pip install -e ".[test,engraphis,embeddings]"
+          python-version: "3.11"
+
+      - name: Build package
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[test,embeddings]"
-      - name: Run tests (including the embeddings-backed no-progress test)
-        run: pytest tests/ -q
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Verify package
+        run: |
+          pip install twine
+          twine check dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}

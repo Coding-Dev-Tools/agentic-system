@@ -1,4 +1,4 @@
-"""Pydantic schemas for the Model Council.
+"""Pydantic schemas for the Model Council + 8 Specialized Gates.
 
 Structured in/out at every boundary: model responses are parsed into
 ModelReview and REJECTED if malformed — a council member that cannot produce
@@ -18,6 +18,18 @@ RECOMMENDATIONS = ("approve", "approve_with_nits", "rework", "reject")
 _APPROVING = ("approve", "approve_with_nits")
 
 DEFAULT_DIMENSIONS = ("correctness", "safety", "style", "tests", "complexity")
+
+# Gate-specific dimension presets
+GATE_DIMENSIONS = {
+    "code_edit": ("correctness", "safety", "style", "tests", "minimal_change"),
+    "pr_review": ("correctness", "safety", "tests", "documentation", "scope"),
+    "merge": ("correctness", "safety", "tests", "ci_status", "branch_protection"),
+    "delegation": ("feasibility", "clarity", "risk", "dependencies", "value"),
+    "security": ("vulnerability_severity", "exploitability", "fix_correctness", "blast_radius", "compliance"),
+    "code_quality": ("complexity", "duplication", "test_coverage", "documentation", "maintainability"),
+    "dependency": ("vulnerability", "license_compliance", "version_freshness", "supply_chain", "breaking_changes"),
+    "architecture": ("cohesion", "coupling", "scalability", "observability", "evolution"),
+}
 
 
 class CouncilMember(BaseModel):
@@ -47,7 +59,7 @@ class CouncilThresholds(BaseModel):
 
 class CouncilRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    subject_type: str                       # PR | REFACTOR | DEPLOYMENT | ESCALATION | ...
+    subject_type: str                       # PR | REFACTOR | DEPLOYMENT | ESCALATION | CODE_EDIT | ...
     subject_ref: dict[str, Any] = Field(default_factory=dict)
     content: str                            # the diff / artifact under review
     artifact_refs: dict[str, Any] = Field(default_factory=dict)  # Engraphis ids
@@ -58,6 +70,7 @@ class CouncilRequest(BaseModel):
     risk_level: str = "medium"               # low | medium | high
     checklist: tuple[str, ...] = ()
     correlation_id: Optional[str] = None
+    gate: Optional[str] = None               # code_edit | pr_review | merge | delegation | security | code_quality | dependency | architecture
 
     @field_validator("risk_level")
     @classmethod
@@ -75,8 +88,14 @@ class CouncilRequest(BaseModel):
             "scale": [self.scale_min, self.scale_max],
             "decision_type": self.decision_type,
             "checklist": list(self.checklist),
+            "gate": self.gate,
         }, sort_keys=True)
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+    def effective_dimensions(self) -> tuple[str, ...]:
+        if self.gate and self.gate in GATE_DIMENSIONS:
+            return GATE_DIMENSIONS[self.gate]
+        return self.rubric_dimensions
 
 
 class ModelReview(BaseModel):
@@ -125,6 +144,7 @@ class CouncilDecision(BaseModel):
     per_model: dict[str, Any] = Field(default_factory=dict)
     cached: bool = False
     reason: str = ""
+    gate: Optional[str] = None
 
     @field_validator("decision")
     @classmethod
@@ -136,4 +156,4 @@ class CouncilDecision(BaseModel):
 
 __all__ = ["CouncilMember", "CouncilThresholds", "CouncilRequest", "ModelReview",
            "PeerScore", "PeerEval", "CouncilDecision", "DEFAULT_DIMENSIONS",
-           "RECOMMENDATIONS"]
+           "RECOMMENDATIONS", "GATE_DIMENSIONS"]

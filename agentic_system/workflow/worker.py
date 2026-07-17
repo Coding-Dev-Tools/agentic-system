@@ -1,115 +1,94 @@
-"""Generic workflow worker: claims tasks, drives the agent FSM, runs handlers.
+"""Workflow worker: background process that polls, claims, executes, advances.
 
-The deterministic seam between the workflow engine and probabilistic work:
-handlers do the actual work (an AIAgent turn, a subprocess test run, a council
-session) and return an ``output_ref`` (ideally an Engraphis memory id). The
-worker owns all control flow — FSM transitions, heartbeats, per-state tool
-policy, budgets -- so LLM output can never steer the DAG.
+Run as a separate process (systemd, PM2, Windows service) or as a thread.
+Integrates with the host's token budget and circuit breakers.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+import signal
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any, Optional
 
-from agentic_system.events.state_tables import connect, ensure_state_tables, heartbeat
-from agentic_system.no_progress import NoProgress, NoProgressDetector
-from agentic_system.state_machine import TRANSITIONS, AgentState, AgentStateMachine
-from agentic_system.workflow.engine import WorkflowEngine
+from agentic_system.workflow.engine import WorkflowEngine, WorkflowWorker
 
 logger = logging.getLogger("agentic_system.workflow.worker")
 
-# handler(task_dict) -> output_ref | None; raise to fail the task
-Handler = Callable[[dict], Optional[str]]
+
+@dataclass
+class WorkerConfig:
+    worker_id: str
+    poll_interval: float = 5.0
+    max_parallel: int = 4
+    shutdown_timeout: float = 30.0
 
 
-class WorkflowWorker:
-    def __init__(self, agent_id: str, engine: WorkflowEngine,
-                 handlers: dict[str, Handler], role: str = "",
-                 cooldown_seconds: float = 60.0,
-                 no_progress: Optional[NoProgressDetector] = None):
-        self.agent_id = agent_id
+class WorkflowRunner:
+    """High-level workflow runner with multiple workers."""
+
+    def __init__(self, engine: WorkflowEngine, config: WorkerConfig):
         self.engine = engine
-        self.handlers = handlers
-        self.role = role
-        self.fsm = AgentStateMachine(agent_id, role=role, bus=engine.bus,
-                                     cooldown_seconds=cooldown_seconds)
-        self._conn = connect(engine.db_path)
-        ensure_state_tables(self._conn)
-        # Optional loop detector a handler raises out of; the worker maps the
-        # raised NoProgress onto the FSM ``no_progress`` event (EXECUTING -> FAILED).
-        # The handler owns the per-step observe() calls (it has the tool outputs);
-        # the worker owns the control-flow bridge. None disables the bridge.
-        self.no_progress = no_progress
+        self.config = config
+        self._workers: list[WorkflowWorker] = []
+        self._executor = ThreadPoolExecutor(max_workers=config.max_parallel)
+        self._stop = threading.Event()
 
-    def run_once(self) -> bool:
-        """Claim and execute at most one task. Returns True if work was done."""
-        heartbeat(self._conn, self.agent_id, self.role,
-                  status=self.fsm.state.value)
-        try:
-            if not self.fsm.can_accept_task():
-                return False
-            task = None
-            self.fsm.handle("task_available")  # optimistic; claim may still lose
-            task = self.engine.claim_next(self.agent_id,
-                                          types=list(self.handlers), role=self.role or None)
-            if task is None:
-                self.fsm.handle("claim_lost")
-                return False
-            self.fsm.handle("task_claimed", {"task_id": task["id"]})
-            heartbeat(self._conn, self.agent_id, self.role, status="EXECUTING")
-            handler = self.handlers[task["type"]]
-            self.fsm.handle("plan_ok")  # handlers embed their own planning
-            output_ref = handler(task)
-            self.fsm.handle("output_ready")
-            self.engine.complete_task(task["id"], output_ref=output_ref)
-            self.fsm.handle("approved")
-            self.fsm.handle("reset")
-            if self.no_progress is not None:
-                self.no_progress.reset()  # fresh window for the next task
-            return True
-        except Exception as exc:
-            task_id = task["id"] if task is not None else None
-            reason = f"{type(exc).__name__}: {exc}"
-            if isinstance(exc, NoProgress):
-                reason = f"no_progress: {exc}"
-            if task_id is not None:
-                logger.exception("worker %s failed task %s", self.agent_id, task_id)
-                self.engine.fail_task(task_id, reason=reason)
-            else:
-                # failed before a task was claimed (e.g. claim_next raised) --
-                # nothing to requeue; just log and cool down.
-                logger.exception("worker %s failed before claiming a task", self.agent_id)
-            # A NoProgress loop drives the dedicated FSM event (EXECUTING -> FAILED);
-            # any other failure -> tool_error/planning_error (also -> FAILED).
-            if self.fsm.state == AgentState.EXECUTING:
-                self.fsm.handle("no_progress" if isinstance(exc, NoProgress) else "tool_error")
-            elif self.fsm.state == AgentState.PLANNING:
-                self.fsm.handle("planning_error")
-            elif self.fsm.state == AgentState.CLAIM_TASK:
-                # claim_next raised: nothing was claimed. soft_fail is not a
-                # legal transition from CLAIM_TASK and would raise
-                # InvalidTransition here, leaving the FSM stuck in CLAIM_TASK
-                # (can_accept_task() False forever). Return to IDLE instead.
-                self.fsm.handle("claim_lost")
-            elif self.fsm.state == AgentState.REVIEWING:
-                # complete_task raised after output was produced: drive the
-                # FSM to FAILED through its legal transitions.
-                self.fsm.handle("needs_changes")
-                self.fsm.handle("retries_exhausted")
-            if (self.fsm.state, "soft_fail") in TRANSITIONS:
-                self.fsm.handle("soft_fail")  # -> COOLDOWN; tick() releases it
-            return True
-        finally:
-            # materialize the terminal FSM state (IDLE after reset/claim_lost,
-            # COOLDOWN after a failure) so agent_instances never reports a
-            # stale EXECUTING for an idle agent — heartbeat_sweep and the
-            # status CLI rely on this being accurate.
-            heartbeat(self._conn, self.agent_id, self.role,
-                      status=self.fsm.state.value)
+    def start(self) -> None:
+        for i in range(self.config.max_parallel):
+            worker = WorkflowWorker(
+                self.engine,
+                f"{self.config.worker_id}-{i}",
+                self.config.poll_interval,
+            )
+            worker.start()
+            self._workers.append(worker)
+        logger.info("workflow runner started with %d workers", len(self._workers))
 
-    def close(self) -> None:
-        self._conn.close()
+    def stop(self) -> None:
+        self._stop.set()
+        for w in self._workers:
+            w.stop(self.config.shutdown_timeout)
+        self._executor.shutdown(wait=True)
+        logger.info("workflow runner stopped")
+
+    def submit_task(self, instance_id: str, task_name: str,
+                    fn: callable, *args, **kwargs) -> Any:
+        """Submit a task for execution (host use)."""
+        return self._executor.submit(fn, *args, **kwargs)
 
 
-__all__ = ["WorkflowWorker"]
+def run_worker_cli(engine: WorkflowEngine, worker_id: str,
+                   poll_interval: float = 5.0) -> int:
+    """CLI entry point for `python -m agentic_system.workflow.worker`."""
+    worker = WorkflowWorker(engine, worker_id, poll_interval)
+    stop_event = threading.Event()
+
+    def signal_handler(signum, frame):
+        logger.info("signal %d received, stopping...", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    worker.start()
+    try:
+        while not stop_event.is_set():
+            stop_event.wait(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        worker.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    # Example: python -m agentic_system.workflow.worker <worker_id>
+    from agentic_system.ports import get_config_port
+    db = get_config_port().events_db_path()
+    engine = WorkflowEngine(db)
+    sys.exit(run_worker_cli(engine, sys.argv[1] if len(sys.argv) > 1 else "worker-0"))

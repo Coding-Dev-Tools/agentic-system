@@ -2,8 +2,8 @@
 
 The core (``agentic_system.events``, ``state_machine``, ``breakers``,
 ``no_progress``, ``council``, ``workflow``, ``orchestration_status``,
-``sweeps``) depends only on the stdlib + pydantic. The host supplies four needs
-through Protocol interfaces registered here:
+``sweeps``, ``cron``) depends only on the stdlib + pydantic. The host supplies
+five needs through Protocol interfaces registered here:
 
 1. **ConfigPort** — is orchestration enabled, where is the events DB, what
    council members/thresholds are configured, per-state tool policy overrides.
@@ -12,11 +12,12 @@ through Protocol interfaces registered here:
    ``llm_fn`` used by :class:`council.CouncilService` when no ``llm_fn`` is
    passed). A host registers its provider/credential-backed implementation.
 4. **CronPort** — register periodic sweep jobs (scripts dir, list/create).
+5. **EngraphisPort** — optional council verdict persistence to Engraphis.
 
 A host calls ``set_config_port`` / ``set_token_budget_port`` /
-``set_default_llm_fn`` / ``set_cron_port`` at startup. Tests register fakes.
-This seam is what makes the package reusable from any Python agent runtime,
-not just Hermes.
+``set_default_llm_fn`` / ``set_cron_port`` / ``set_engraphis_port`` at startup.
+Tests register fakes. This seam is what makes the package reusable from any
+Python agent runtime, not just Hermes.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ class ConfigPort(Protocol):
     def events_db_path(self) -> str: ...
     def council_config(self) -> Optional[dict]: ...
     def state_tool_policy(self) -> Optional[dict]: ...
+    def high_impact_tool_patterns(self) -> Optional[tuple[str, ...]]: ...
 
 
 @runtime_checkable
@@ -53,6 +55,16 @@ class CronPort(Protocol):
                    workdir: str) -> None: ...
 
 
+@runtime_checkable
+class EngraphisPort(Protocol):
+    """Optional Engraphis persistence for council verdicts."""
+
+    def remember(self, content: str, workspace: str, mtype: str = "episodic",
+                 scope: str = "workspace", title: str = "",
+                 source: str = "agent:council", kind: str = "council_verdict",
+                 importance: float = 0.6) -> Optional[str]: ...
+
+
 # A council LLM call: (member, system_prompt, user_prompt) -> raw model text.
 LLMFn = Callable[[Any, str, str], str]
 
@@ -62,6 +74,7 @@ LLMFn = Callable[[Any, str, str], str]
 _config_port: Optional[ConfigPort] = None
 _token_budget_port: Optional[TokenBudgetPort] = None
 _cron_port: Optional[CronPort] = None
+_engraphis_port: Optional[EngraphisPort] = None
 _default_llm_fn: Optional[LLMFn] = None
 
 
@@ -89,6 +102,10 @@ def get_cron_port() -> CronPort:
     return _cron_port
 
 
+def get_engraphis_port() -> Optional[EngraphisPort]:
+    return _engraphis_port
+
+
 def get_default_llm_fn() -> LLMFn:
     if _default_llm_fn is None:
         raise RuntimeError(
@@ -112,6 +129,11 @@ def set_cron_port(port: CronPort) -> None:
     _cron_port = port
 
 
+def set_engraphis_port(port: EngraphisPort) -> None:
+    global _engraphis_port
+    _engraphis_port = port
+
+
 def set_default_llm_fn(fn: LLMFn) -> None:
     global _default_llm_fn
     _default_llm_fn = fn
@@ -119,17 +141,18 @@ def set_default_llm_fn(fn: LLMFn) -> None:
 
 def reset_ports_for_tests() -> None:
     """Drop every registered port/LLM (restore the "nothing registered" state)."""
-    global _config_port, _token_budget_port, _cron_port, _default_llm_fn
+    global _config_port, _token_budget_port, _cron_port, _engraphis_port, _default_llm_fn
     _config_port = None
     _token_budget_port = None
     _cron_port = None
+    _engraphis_port = None
     _default_llm_fn = None
 
 
 __all__ = [
-    "ConfigPort", "TokenBudgetPort", "CronPort", "LLMFn",
+    "ConfigPort", "TokenBudgetPort", "CronPort", "EngraphisPort", "LLMFn",
     "get_config_port", "get_token_budget_port", "get_cron_port",
-    "get_default_llm_fn",
+    "get_engraphis_port", "get_default_llm_fn",
     "set_config_port", "set_token_budget_port", "set_cron_port",
-    "set_default_llm_fn", "reset_ports_for_tests",
+    "set_engraphis_port", "set_default_llm_fn", "reset_ports_for_tests",
 ]

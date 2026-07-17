@@ -4,72 +4,63 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic-system"
-version = "0.2.0"
-description = "Framework-agnostic orchestration layer for autonomous agents: durable event store, deterministic FSM, circuit breakers, no-progress detection, workflow DAG engine, model council, sweeps, and a status/health CLI."
+version = "0.3.0"
+description = "Framework-agnostic orchestration layer for autonomous agents: circuit breakers, multi-LLM council, workflow FSM, sweeps. Companion to Engraphis."
 readme = "README.md"
-license = { text = "MIT" }
-authors = [{ name = "agentic-system contributors" }]
-requires-python = ">=3.10"
-keywords = ["agent", "orchestration", "llm", "council", "circuit-breaker", "fsm", "workflow", "autonomous-agents"]
-dependencies = [
-    "pydantic>=2.0",
-    "PyYAML>=5.4",
-]
+license = {text = "MIT"}
+authors = [{name = "Coding-Dev-Tools", email = "jaixii@protonmail.com"}]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Intended Audience :: Developers",
 ]
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.8",
+    "PyYAML>=6.0",
+]
+optional-dependencies = {
+    "engraphis" = ["engraphis>=0.9.6"],
+    "embeddings" = ["sentence-transformers>=3.0"],
+    "dev" = ["pytest>=8.0", "pytest-asyncio>=0.23", "pytest-cov>=5.0", "ruff>=0.5", "mypy>=1.10"],
+}
 
 [project.urls]
 Homepage = "https://github.com/Coding-Dev-Tools/agentic-system"
 Repository = "https://github.com/Coding-Dev-Tools/agentic-system"
 Issues = "https://github.com/Coding-Dev-Tools/agentic-system/issues"
-Changelog = "https://github.com/Coding-Dev-Tools/agentic-system/blob/main/CHANGELOG.md"
-
-[project.optional-dependencies]
-engraphis = ["engraphis"]          # council verdict persistence to Engraphis
-embeddings = ["sentence-transformers"]  # semantic no-progress detection upgrade path
-test = ["pytest>=7"]
-
 [project.scripts]
-agentic-status = "agentic_system.orchestration_status:main"
+agentic-system = "agentic_system.cli:main"
+orchestration_status = "agentic_system.orchestration_status:main"
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["agentic_system*"]
 
 [tool.setuptools.package-data]
-agentic_system = ["py.typed", "workflow/definitions/*.yaml"]
+"*" = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
-
-[tool.ruff.lint]
-# High-signal, low-nag: syntax errors + pyflakes (unused imports/vars).
-# Deliberately NOT a full style enforcer (no E1xx/E2xx style nags).
-select = ["E9", "F"]
+target-version = "py311"
+select = ["E", "F", "I", "W", "UP", "B", "C4", "PTH", "T20", "TID", "ARG", "PL"]
+ignore = ["T201", "ARG001", "ARG002", "B008"]
+src = ["agentic_system", "tests"]
 
 [tool.mypy]
-# Guard the py.typed contract: catch real type errors without being overly strict.
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
-warn_unused_ignores = true
-warn_redundant_casts = true
-disallow_untyped_defs = false  # not a fully typed codebase yet
-ignore_missing_imports = true  # optional deps (engraphis, sentence-transformers) may be missing
-exclude = ["tests/*", "examples/*"]
 warn_unused_configs = true
+disallow_untyped_defs = true
+strict_optional = true
+check_untyped_defs = true
+no_implicit_optional = true
+namespace_packages = true
 
-[[tool.mypy.overrides]]
-module = ["agentic_system.embedding_similarity"]
-# sentence-transformers is optional; ignore its untyped internals
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["agentic_system.council.service"]
-# engraphis is optional
-ignore_missing_imports = true
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

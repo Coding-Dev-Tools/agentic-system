@@ -1,10 +1,22 @@
-"""Model Council service: parallel reviews -> weighted decision.
+"""Model Council Service: parallel reviews -> weighted decision.
+
+8 Specialized Gates (from Hermes battle-testing):
+  - code_edit      : mandatory review for ANY code edit
+  - pr_review      : two-pass review before creating/updating PR
+  - merge          : lenient review before merging PR (trusts PR gate)
+  - delegation     : lenient review before delegating coding task
+  - security       : vulnerability scan + gating
+  - code_quality   : complexity/duplication/coverage audit
+  - dependency     : vuln/license/freshness/supply-chain audit
+  - architecture   : cohesion/coupling/scalability review
 
 Stage 1: fan the same structured-review prompt across N configured council
 members in parallel (reusing the auxiliary call_llm() path, which already
 handles provider resolution, credentials, fallback and retry).
+
 Stage 2 (optional, default risk_level=high only): peer evaluation — each
 member scores the anonymized stage-1 reviews (NAACL'25-style).
+
 Stage 3: deterministic weighted aggregation -> APPROVE / REWORK / REJECT.
 
 Guards & economics:
@@ -45,7 +57,8 @@ from agentic_system.council.schemas import (
     CouncilDecision, CouncilMember, CouncilRequest, CouncilThresholds,
     ModelReview, PeerEval,
 )
-from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
+from agentic_system.events import connect, ensure_state_tables, now_iso
+from agentic_system.ports import get_config_port, get_engraphis_port
 
 logger = logging.getLogger("agentic_system.council")
 
@@ -67,6 +80,18 @@ PEER_SYSTEM = (
     '"justification": "<short>"}]}'
 )
 
+# Gate-specific system prompt overrides
+GATE_SYSTEMS = {
+    "code_edit": REVIEW_SYSTEM + "\nGate: CODE_EDIT — judge minimal, correct diff application.",
+    "pr_review": REVIEW_SYSTEM + "\nGate: PR_REVIEW — two-pass: consistency + correctness.",
+    "merge": REVIEW_SYSTEM + "\nGate: MERGE — lenient; only block explicit REJECT. Trust PR gate.",
+    "delegation": REVIEW_SYSTEM + "\nGate: DELEGATION — lenient; assess feasibility & risk.",
+    "security": REVIEW_SYSTEM + "\nGate: SECURITY — max severity, exploitability, blast radius.",
+    "code_quality": REVIEW_SYSTEM + "\nGate: CODE_QUALITY — complexity, duplication, coverage, docs.",
+    "dependency": REVIEW_SYSTEM + "\nGate: DEPENDENCY — vuln, license, freshness, supply-chain.",
+    "architecture": REVIEW_SYSTEM + "\nGate: ARCHITECTURE — cohesion, coupling, scalability, evolution.",
+}
+
 
 def _default_llm_fn(member: CouncilMember, system: str, user: str) -> str:
     """Default council LLM call, delegated to the host-registered LLMPort
@@ -87,13 +112,10 @@ def _extract_json(text: str) -> dict[str, Any]:
 
 
 class CouncilService:
-    # ── provider failure tracking ────────────────────────────────────────
-    # When a provider fails or times out (>60s), it enters a 15-minute cooldown.
-    # During cooldown the member is skipped and its weight is redistributed
-    # to NVIDIA members (the dual-key highest-advisor provider).
+    # ── Provider failure tracking ────────────────────────────────────────
     _COOLDOWN_SECONDS = 15 * 60  # 15 minutes
-    _MAX_ATTEMPTS_PER_COOLDOWN = 2  # never a 3rd attempt within 15 min
-    _STAGE1_TIMEOUT = 60  # seconds — any member exceeding this is skipped
+    _MAX_ATTEMPTS_PER_COOLDOWN = 2
+    _STAGE1_TIMEOUT = 60  # seconds
 
     def __init__(self, db_path: str, bus: Any = None,
                  members: Optional[list[dict]] = None,
@@ -106,26 +128,19 @@ class CouncilService:
         ensure_state_tables(self._conn)
         self.bus = bus
         cfg_members, cfg_thresholds, cfg_peer, cfg_quorum = self._load_config()
-        # Precedence: an explicit constructor argument wins over config; config
-        # supplies the default when the argument is None. (Previously
-        # min_quorum/peer_eval let config OVERRIDE the constructor arg, which
-        # was inconsistent with members/thresholds -- now constructor wins
-        # everywhere, the usual Python convention.)
         self.members = [CouncilMember(**m) for m in (members or cfg_members)]
         self.thresholds = CouncilThresholds(**(thresholds or cfg_thresholds))
         self.peer_eval = peer_eval or cfg_peer or "high_risk_only"
         self.min_quorum = int(min_quorum if min_quorum is not None
-                             else (cfg_quorum if cfg_quorum is not None else 2))
+                              else (cfg_quorum if cfg_quorum is not None else 2))
         self.llm_fn = llm_fn or _default_llm_fn
         self.persist_hook = persist_hook
-        # Provider failure tracker: {provider_key: {"fails": int, "first_fail": float, "attempts": int}}
         self._failures: dict[str, dict] = {}
         self._failures_lock = threading.Lock()
 
     @staticmethod
     def _load_config():
-        """Council config via the ConfigPort seam (host-agnostic); silent
-        fallback to defaults. Returns (members, thresholds, peer_eval, min_quorum)."""
+        """Council config via the ConfigPort seam (host-agnostic)."""
         try:
             from agentic_system.ports import get_config_port
             cc = get_config_port().council_config()
@@ -136,7 +151,7 @@ class CouncilService:
         except Exception:
             return [], {}, None, None
 
-    # ── main entry ───────────────────────────────────────────────────────
+    # ── Main entry ───────────────────────────────────────────────────────
     def review(self, request: CouncilRequest) -> CouncilDecision:
         if not self.members:
             raise RuntimeError("council has no members configured "
@@ -155,6 +170,7 @@ class CouncilService:
                 session_id=session_id, decision="REWORK",
                 reason=f"insufficient_quorum: {len(reviews)}/{self.min_quorum} "
                        f"valid reviews", per_model={m: r.model_dump() for m, r in reviews.items()},
+                gate=request.gate,
             )
             self._finalize(session_id, request, reviews, {}, decision)
             return decision
@@ -165,19 +181,18 @@ class CouncilService:
             peer_evals = self._stage2(request, reviews)
 
         decision = self._aggregate(session_id, reviews, peer_evals)
+        decision.gate = request.gate
         self._finalize(session_id, request, reviews, peer_evals, decision)
         return decision
 
-    # ── stage 1: parallel structured reviews ─────────────────────────────
+    # ── Provider failure tracking ────────────────────────────────────────
     def _provider_key(self, member: CouncilMember) -> str:
-        """Unique key per provider+model+key combo for failure tracking."""
         return f"{member.provider or 'default'}:{member.id}"
 
     def _is_nvidia(self, member: CouncilMember) -> bool:
         return (member.provider or "").lower() == "nvidia"
 
     def _is_in_cooldown(self, member: CouncilMember) -> bool:
-        """Check if a provider is in 15-minute cooldown (max 2 attempts)."""
         key = self._provider_key(member)
         with self._failures_lock:
             state = self._failures.get(key)
@@ -185,13 +200,11 @@ class CouncilService:
                 return False
             elapsed = time.time() - state["first_fail"]
             if elapsed >= self._COOLDOWN_SECONDS:
-                # Cooldown expired — reset
                 del self._failures[key]
                 return False
             return bool(state["attempts"] >= self._MAX_ATTEMPTS_PER_COOLDOWN)
 
     def _record_failure(self, member: CouncilMember):
-        """Record a provider failure and increment attempt counter."""
         key = self._provider_key(member)
         with self._failures_lock:
             state = self._failures.get(key)
@@ -199,7 +212,6 @@ class CouncilService:
             if not state:
                 self._failures[key] = {"fails": 1, "first_fail": now, "attempts": 1}
             else:
-                # Reset if cooldown expired
                 if now - state["first_fail"] >= self._COOLDOWN_SECONDS:
                     self._failures[key] = {"fails": 1, "first_fail": now, "attempts": 1}
                 else:
@@ -210,17 +222,11 @@ class CouncilService:
                            self._MAX_ATTEMPTS_PER_COOLDOWN)
 
     def _record_success(self, member: CouncilMember):
-        """Clear failure state on success."""
         key = self._provider_key(member)
         with self._failures_lock:
             self._failures.pop(key, None)
 
     def _effective_members(self) -> list[tuple[CouncilMember, float]]:
-        """Return (member, effective_weight) pairs.
-
-        Members in cooldown are excluded. Their weight is redistributed
-        equally to NVIDIA members (the dual-key highest-advisor provider).
-        """
         active = []
         cooldown_weight = 0.0
         for m in self.members:
@@ -231,7 +237,6 @@ class CouncilService:
             else:
                 active.append((m, m.weight))
 
-        # Redistribute cooldown weight to NVIDIA members
         if cooldown_weight > 0:
             nvidia_members = [(m, w) for m, w in active if self._is_nvidia(m)]
             if nvidia_members:
@@ -245,9 +250,10 @@ class CouncilService:
 
         return active
 
+    # ── Stage 1: parallel structured reviews ─────────────────────────────
     def _stage1(self, request: CouncilRequest) -> dict[str, ModelReview]:
         lo, hi = request.scale_min, request.scale_max
-        system = REVIEW_SYSTEM.replace("{lo}", str(lo)).replace("{hi}", str(hi))
+        system = GATE_SYSTEMS.get(request.gate, REVIEW_SYSTEM).replace("{lo}", str(lo)).replace("{hi}", str(hi))
         user = self._review_prompt(request)
         reviews: dict[str, ModelReview] = {}
 
@@ -256,18 +262,19 @@ class CouncilService:
             logger.error("council: all members in cooldown!")
             return reviews
 
+        dims = request.effective_dimensions()
+
         def one(member: CouncilMember) -> Optional[ModelReview]:
-            # Check cooldown again right before calling (race safety)
             if self._is_in_cooldown(member):
                 return None
-            prompt = user  # per-member copy; retry appends a repair note
-            for attempt in (1, 2):  # one repair retry (max 2 attempts)
+            prompt = user
+            for attempt in (1, 2):
                 try:
                     raw = self.llm_fn(member, system, prompt)
                     data = _extract_json(raw)
                     data["model_id"] = member.id
                     review = ModelReview(**data)
-                    missing = set(request.rubric_dimensions) - set(review.self_scores)
+                    missing = set(dims) - set(review.self_scores)
                     if missing:
                         raise ValueError(f"missing rubric dimensions: {missing}")
                     self._record_success(member)
@@ -278,8 +285,7 @@ class CouncilService:
                     if attempt == 2:
                         self._record_failure(member)
                     else:
-                        prompt = user + "\n\nYour previous reply was invalid " \
-                                        f"({exc}). Return ONLY the JSON object."
+                        prompt = user + f"\n\nYour previous reply was invalid ({exc}). Return ONLY the JSON object."
             return None
 
         members_only = [m for m, _ in effective]
@@ -287,24 +293,20 @@ class CouncilService:
             futs = {pool.submit(one, m): m for m in members_only}
             done, not_done = futures_wait(futs, timeout=self._STAGE1_TIMEOUT)
 
-            # Cancel & record failures for timed-out members
             for fut in not_done:
                 member = futs[fut]
-                logger.warning(
-                    "council member %s timed out (>%ds), skipping",
-                    member.id, self._STAGE1_TIMEOUT,
-                )
+                logger.warning("council member %s timed out (>%ds), skipping",
+                               member.id, self._STAGE1_TIMEOUT)
                 self._record_failure(member)
                 fut.cancel()
 
-            # Collect reviews from completed members
             for fut in done:
                 r = fut.result()
                 if r is not None:
                     reviews[r.model_id] = r
         return reviews
 
-    # ── stage 2: peer evaluation ─────────────────────────────────────────
+    # ── Stage 2: peer evaluation ─────────────────────────────────────────
     def _stage2(self, request: CouncilRequest,
                 reviews: dict[str, ModelReview]) -> dict[str, PeerEval]:
         lo, hi = request.scale_min, request.scale_max
@@ -336,7 +338,7 @@ class CouncilService:
                     evals[e.evaluator_model_id] = e
         return evals
 
-    # ── stage 3: deterministic weighted aggregation ─────────
+    # ── Stage 3: deterministic weighted aggregation ─────────
     def _aggregate(self, session_id: str, reviews: dict[str, ModelReview],
                    peer_evals: dict[str, PeerEval]) -> CouncilDecision:
         weights = {m.id: m.weight for m in self.members}
@@ -384,14 +386,14 @@ class CouncilService:
             per_model=agg,
         )
 
-    # ── persistence, cache, events ───────────────────────────────────────
+    # ── Persistence, cache, events ───────────────────────────────────────
     def _review_prompt(self, request: CouncilRequest) -> str:
         checklist = "\n".join(f"- {c}" for c in request.checklist) or "- (none)"
+        dims = ", ".join(request.effective_dimensions())
         return (f"Decision type: {request.decision_type} | "
                 f"Risk: {request.risk_level} | Subject: {request.subject_type} "
                 f"{json.dumps(request.subject_ref)}\n"
-                f"Rubric dimensions: {', '.join(request.rubric_dimensions)} "
-                f"(scale {request.scale_min}-{request.scale_max})\n"
+                f"Rubric dimensions: {dims} (scale {request.scale_min}-{request.scale_max})\n"
                 f"Checklist:\n{checklist}\n\n"
                 f"ARTIFACT:\n{request.content}")
 
@@ -413,7 +415,7 @@ class CouncilService:
                 session_id=row["id"], decision=row["decision"],
                 metrics=session.get("metrics", {}),
                 per_model=session.get("per_model", {}),
-                cached=True, reason="verdict_cache_hit",
+                cached=True, reason="verdict_cache_hit", gate=request.gate,
             )
         except Exception:
             return None
@@ -444,16 +446,18 @@ class CouncilService:
             "risk_level": request.risk_level,
             "decision_type": request.decision_type,
             "correlation_id": request.correlation_id,
+            "gate": request.gate,
         }
         engraphis_ref = None
         if self.persist_hook is not None:
-            try:  # blackboard write is best-effort, never blocks the verdict
+            try:
                 engraphis_ref = self.persist_hook({
                     "session_id": session_id, "decision": decision.decision,
                     "subject_type": request.subject_type,
                     "subject_ref": request.subject_ref,
                     "metrics": decision.metrics, "session": session,
                     "correlation_id": request.correlation_id,
+                    "gate": request.gate,
                 })
             except Exception:
                 logger.exception("council persist_hook failed")
@@ -479,7 +483,8 @@ class CouncilService:
                 {"session_id": decision.session_id, "decision": decision.decision,
                  "metrics": decision.metrics, "cached": decision.cached,
                  "subject_type": request.subject_type,
-                 "risk_level": request.risk_level, "reason": decision.reason},
+                 "risk_level": request.risk_level, "reason": decision.reason,
+                 "gate": request.gate},
                 aggregate_type="CouncilSession", aggregate_id=decision.session_id,
                 correlation_id=request.correlation_id,
                 priority="high" if decision.decision != "APPROVE" else "normal",
