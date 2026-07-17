@@ -240,8 +240,6 @@ def ensure_state_tables(conn) -> None:
     conn.commit()
 
 
-from .async_bus import AsyncEventBus, AsyncEvent, async_bus
-
 __all__ = [
     "Event", "EventBus", "get_bus", "events_db_path", "reset_bus_for_tests",
     "connect", "ensure_state_tables", "now_iso",
@@ -249,3 +247,9 @@ __all__ = [
 ]
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+# Imported last: async_bus does `from agentic_system.events import now_iso`,
+# which is only defined above once this module is fully initialized. Importing
+# it earlier triggers a circular-import ImportError.
+from .async_bus import AsyncEventBus, AsyncEvent, async_bus

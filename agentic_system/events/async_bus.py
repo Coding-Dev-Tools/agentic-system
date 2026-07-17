@@ -129,9 +129,6 @@ async def async_bus(db_path: Optional[str] = None) -> AsyncGenerator[AsyncEventB
 
 # ── Async Council Integration ─────────────────────────────────────────────
 
-from agentic_system.council import CouncilService, CouncilRequest
-from agentic_system.council.schemas import CouncilDecision
-
 
 async def review_async(
     request: CouncilRequest,
@@ -145,6 +142,8 @@ async def review_async(
     persist_hook: Optional[Callable] = None,
 ) -> CouncilDecision:
     """Convenience: run a council review in a thread pool (CouncilService is sync)."""
+    from agentic_system.council import CouncilService, CouncilRequest
+    from agentic_system.council.schemas import CouncilDecision
     loop = asyncio.get_event_loop()
 
     def _sync():
