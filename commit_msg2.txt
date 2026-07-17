@@ -1,0 +1,1 @@
+feat: v0.3.0 -- 8 council gates, breaker self-heal, security council, workflow engine, cron, sweeps, observability, CLI, examples, CI
