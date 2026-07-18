@@ -4,6 +4,40 @@ All notable changes to agentic-system are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **council** — built-in and custom `GatePolicy` support with explicit
+  higher/lower score direction, per-dimension approval thresholds, and
+  host-derived evidence-score overrides.
+- **council** — one configurable deliberation deadline across review and peer
+  stages; deadline-aware LLM adapters receive `timeout_seconds`.
+- **council** — per-member outcomes for success, timeout, provider error,
+  invalid output, and cooldown.
+
+### Changed
+- Council aggregation now weights member scores consistently and applies only
+  the dimensions declared by the selected gate.
+- Cache fingerprints now include subject metadata, evidence, risk, policy,
+  thresholds, member providers/weights, and a policy version. Cache entries
+  expire after one hour by default; degraded sessions are not cached.
+- Council inputs and model responses now enforce finite in-range scores,
+  bounded payloads, strict JSON objects, unique member/dimension identifiers,
+  and valid quorum configuration.
+- Provider cooldown no longer redistributes unavailable weight to a
+  vendor-specific model.
+
+### Fixed
+- Cache hits preserve the original decision reason, and uncaught review
+  failures now leave a terminal `FAILED` session instead of stale `RUNNING`
+  state.
+- Optional null council-config entries use documented defaults, registered
+  config backend failures propagate, and replacing an LLM adapter refreshes
+  cooperative-timeout detection.
+- Positional-only parameters are no longer mistaken for keyword timeout
+  support; peer-call outcomes remain visible even when that member's initial
+  review failed.
+
 ## [0.2.0] — 2026-07-11
 
 Public-launch polish: self-contained for new users, framework-agnostic, type-checked.

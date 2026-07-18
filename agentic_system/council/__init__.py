@@ -1,12 +1,13 @@
 from .schemas import (
-    CouncilMember, CouncilThresholds, CouncilRequest, ModelReview,
-    PeerScore, PeerEval, CouncilDecision, DEFAULT_DIMENSIONS, RECOMMENDATIONS,
+    CouncilDecision, CouncilMember, CouncilRequest, CouncilThresholds,
+    DimensionPolicy, GatePolicy, ModelReview, PeerEval, PeerScore, ScoreDirection,
+    DEFAULT_DIMENSIONS, GATE_POLICIES, RECOMMENDATIONS,
 )
 from .service import CouncilService, make_engraphis_persist_hook
 
 __all__ = [
     "CouncilService", "make_engraphis_persist_hook",
     "CouncilMember", "CouncilThresholds", "CouncilRequest", "ModelReview",
-    "PeerScore", "PeerEval", "CouncilDecision",
-    "DEFAULT_DIMENSIONS", "RECOMMENDATIONS",
+    "PeerScore", "PeerEval", "CouncilDecision", "DimensionPolicy", "GatePolicy",
+    "ScoreDirection", "DEFAULT_DIMENSIONS", "GATE_POLICIES", "RECOMMENDATIONS",
 ]

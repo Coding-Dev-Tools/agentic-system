@@ -9,8 +9,8 @@ any Python agent runtime to get:
   high-impact-tool gating (deploy/push/publish, including commands inside `terminal`).
 - **No-progress loop detection** (stdlib difflib; pluggable embeddings upgrade).
 - **Workflow DAG engine** (CAS claiming, idempotent advance, restart-resume) + worker.
-- **Model Council** — parallel multi-model structured review → weighted verdict,
-  peer-eval for high risk, verdict cache, optional Engraphis persistence.
+- **Model Council** — deadline-bounded multi-model review, deterministic named
+  or custom gate policies, peer evaluation, safe caching, and optional Engraphis persistence.
 - **Periodic sweeps** — heartbeat / stuck-task recovery / metric watchdog / nightly consolidate.
 - **Read-only status / health CLI** — `python -m agentic_system.orchestration_status`
   (exits non-zero when any breaker is OPEN, so it doubles as a health check).
@@ -48,16 +48,24 @@ class MyConfig:                       # implement ports.ConfigPort
     def orchestration_enabled(self): return True
     def events_db_path(self): return "/var/lib/myagent/events.db"
     def council_config(self): return {                              # or None
-        "members": [{"id": "my-model", "provider": "mine", "weight": 1.0}],
+        "members": [
+            {"id": "reviewer-a", "provider": "mine", "weight": 1.0},
+            {"id": "reviewer-b", "provider": "mine", "weight": 1.0},
+        ],
         "thresholds": {"min_overall": 4.0, "min_safety": 4.5,
-                       "min_tests": 3.5, "min_agreement": 0.7, "reject_max_overall": 2.5},
-        "peer_eval": "high_risk_only", "min_quorum": 2}
+                       "min_tests": 3.5, "min_agreement": 0.7,
+                       "reject_max_overall": 2.5},
+        "peer_eval": "high_risk_only", "min_quorum": 2,
+        "review_timeout_seconds": 60, "max_parallel_reviews": 8,
+        "max_content_chars": 100_000, "max_model_response_chars": 50_000,
+    }
     def state_tool_policy(self): return None
 
 class MyBudget:                       # implement ports.TokenBudgetPort
     def make(self, max_tokens): ...   # -> object with consume(tokens)/exceeded/used/max_total
 
-def my_llm(member, system, user): ... # ports.LLMFn: (member, system, user) -> raw text
+def my_llm(member, system, user, *, timeout_seconds):
+    ...  # pass timeout_seconds to the provider's HTTP/API timeout
 
 ports.set_config_port(MyConfig())
 ports.set_token_budget_port(MyBudget())
@@ -83,9 +91,14 @@ hooks.emit_turn_completed(agent, task_id, api_calls, total_tokens)
 # gate high-impact tools when the global breaker is OPEN
 if high_impact_block_message(tool_name, tool_args): ...  # refuse
 
-# run a model council review
-svc = CouncilService(db_path, persist_hook=make_engraphis_persist_hook())
-decision = svc.review(CouncilRequest(subject_type="PR", content=diff, risk_level="medium"))
+# run a deadline-bounded PR review under a deterministic gate policy
+svc = CouncilService(
+    db_path, persist_hook=make_engraphis_persist_hook(),
+    review_timeout_seconds=60,
+)
+decision = svc.review(CouncilRequest(
+    subject_type="PR", content=diff, risk_level="medium", gate="pr_review",
+))
 
 # run a workflow DAG to completion
 engine = WorkflowEngine(db_path, definitions=load_directory())
@@ -95,6 +108,40 @@ while worker.run_once(): pass
 # inspect the whole system
 # $ python -m agentic_system.orchestration_status
 ```
+
+## Council gates and deadlines
+
+Built-in gates are `code_edit`, `pr_review`, `merge`, `delegation`, `security`,
+`code_quality`, `dependency`, and `architecture`. Each declares its exact
+dimensions, whether higher or lower scores are better, and approval floors.
+`GatePolicy` and `DimensionPolicy` provide the same contract for host-specific
+gates; policy checks run in Python after model output validation.
+
+Tool-backed facts belong in `evidence_scores`. They override every model's score
+for that dimension. The `merge` gate requires host-derived `ci_status` and
+`branch_protection` scores, so model claims cannot turn failed CI into approval:
+
+```python
+request = CouncilRequest(
+    subject_type="MERGE",
+    subject_ref={"repo": "org/project", "pr": 42},
+    content=diff,
+    gate="merge",
+    evidence={"ci_url": ci_url, "required_checks": required_checks},
+    evidence_scores={"ci_status": 5, "branch_protection": 5},
+)
+decision = svc.review(request)
+```
+
+`review_timeout_seconds` is one shared deadline across review and peer-evaluation
+calls. Adapters accepting the keyword-only `timeout_seconds` argument can cancel
+provider I/O cooperatively. Legacy three-argument adapters remain compatible;
+their late calls are discarded and cannot delay the returned verdict, but may
+finish in a background thread. Per-member outcomes distinguish `success`,
+`timeout`, `provider_error`, `invalid_output`, and `cooldown`. Only complete
+sessions are cached; cache identity includes policy, risk, thresholds, model
+providers and weights, while `cache_ttl_seconds=0` disables replay.
+Cache hits set `cached=True` while preserving the original decision reason.
 
 ## Status / health check
 

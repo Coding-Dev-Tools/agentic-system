@@ -8,9 +8,9 @@ through Protocol interfaces registered here:
 1. **ConfigPort** — is orchestration enabled, where is the events DB, what
    council members/thresholds are configured, per-state tool policy overrides.
 2. **TokenBudgetPort** — the per-task cumulative token-counter primitive.
-3. **LLMPort** — one structured LLM call per council member (the default
-   ``llm_fn`` used by :class:`council.CouncilService` when no ``llm_fn`` is
-   passed). A host registers its provider/credential-backed implementation.
+3. **LLMPort** — one structured LLM call per council member. Adapters should
+   accept a keyword-only ``timeout_seconds`` value so provider I/O observes the
+   council deadline; legacy three-argument callables remain supported.
 4. **CronPort** — register periodic sweep jobs (scripts dir, list/create).
 
 A host calls ``set_config_port`` / ``set_token_budget_port`` /
@@ -21,14 +21,14 @@ not just Hermes.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, Sequence, Union, runtime_checkable
 
 
 @runtime_checkable
 class ConfigPort(Protocol):
     def orchestration_enabled(self) -> bool: ...
     def events_db_path(self) -> str: ...
-    def council_config(self) -> Optional[dict]: ...
+    def council_config(self) -> Optional[dict[str, Any]]: ...
     def state_tool_policy(self) -> Optional[dict]: ...
 
 
@@ -53,8 +53,23 @@ class CronPort(Protocol):
                    workdir: str) -> None: ...
 
 
-# A council LLM call: (member, system_prompt, user_prompt) -> raw model text.
-LLMFn = Callable[[Any, str, str], str]
+LegacyLLMFn = Callable[[Any, str, str], str]
+
+
+class DeadlineAwareLLMFn(Protocol):
+    """Council adapter that cooperatively observes the remaining deadline."""
+
+    def __call__(
+        self,
+        member: Any,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        timeout_seconds: float,
+    ) -> str: ...
+
+
+LLMFn = Union[LegacyLLMFn, DeadlineAwareLLMFn]
 
 
 # ── Swappable process-wide registry ───────────────────────────────────────
@@ -127,7 +142,8 @@ def reset_ports_for_tests() -> None:
 
 
 __all__ = [
-    "ConfigPort", "TokenBudgetPort", "CronPort", "LLMFn",
+    "ConfigPort", "TokenBudgetPort", "CronPort",
+    "LegacyLLMFn", "DeadlineAwareLLMFn", "LLMFn",
     "get_config_port", "get_token_budget_port", "get_cron_port",
     "get_default_llm_fn",
     "set_config_port", "set_token_budget_port", "set_cron_port",
