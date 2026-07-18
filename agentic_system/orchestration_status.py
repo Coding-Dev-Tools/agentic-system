@@ -1,126 +1,208 @@
-"""Read-only status / health CLI for the orchestration layer.
+"""Read-only status surface for the orchestration layer.
 
-Exits non-zero when any breaker is OPEN, so it doubles as a health check.
+One command to inspect an unattended/autonomous Hermes setup:
 
-Usage::
+    python -m agentic_system.orchestration_status            # human summary
+    python -m agentic_system.orchestration_status --tail 50  # more recent events
+    python -m agentic_system.orchestration_status --json     # machine-readable
+    python -m agentic_system.orchestration_status --db /path/events.db
 
-    python -m agentic_system.orchestration_status
-    # JSON output:
-    python -m agentic_system.orchestration_status --json
+Reads the configured events DB (override via ``AGENTIC_EVENTS_DB`` /
+``HERMES_EVENTS_DB`` (back-compat) / ``orchestration.db_path`` / ``--db``) directly
+-- no orchestration flag required, so it works against whatever an autonomous
+run has written. Safe
+to run any time: opens a read-only view, never writes, degrades cleanly on a
+missing/empty DB. Intended for headless inspection (after the fact) and for
+cron/health-checks (exit code 1 when any breaker is OPEN).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sqlite3
 import sys
-from typing import Any
-
-from agentic_system.breakers import get_registry
-from agentic_system.council.service import CouncilService
-from agentic_system.events import get_bus, events_db_path
-from agentic_system.ports import get_config_port
-from agentic_system.workflow.engine import WorkflowEngine
+from typing import Any, Optional
 
 
-def collect_status() -> dict[str, Any]:
-    """Gather a full read-only status snapshot."""
-    config = get_config_port()
-    db = events_db_path()
-    reg = get_registry(db)
-    bus = get_bus(db)
-
-    # Breakers
-    breaker_snapshot = reg.snapshot()
-    global_open = any(b["level"] == "global" and b["state"] == "OPEN"
-                      for b in breaker_snapshot)
-
-    # Council
-    council_status = {"configured": False}
+def _db_path(arg_db: Optional[str]) -> str:
+    if arg_db:
+        return arg_db
+    # AGENTIC_EVENTS_DB is the neutral override; HERMES_EVENTS_DB is a
+    # back-compat alias so existing Hermes status-CLI users aren't broken.
+    env = os.getenv("AGENTIC_EVENTS_DB", "").strip() or os.getenv("HERMES_EVENTS_DB", "").strip()
+    if env:
+        return env
     try:
-        council = CouncilService(db)
-        council_status = {
-            "configured": True,
-            "members": [m.id for m in council.members],
-            "thresholds": council.thresholds.model_dump(),
-            "peer_eval": council.peer_eval,
-            "min_quorum": council.min_quorum,
+        from agentic_system.events.hooks import events_db_path
+        return events_db_path()
+    except Exception:
+        from pathlib import Path
+        return str(Path.cwd() / "events.db")
+
+
+def _connect(db_path: str) -> Optional[sqlite3.Connection]:
+    if not os.path.exists(db_path):
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _rows(conn: sqlite3.Connection, sql: str, args: tuple = ()) -> list[dict]:
+    try:
+        return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    except sqlite3.OperationalError:
+        # table missing on a fresh/partial DB
+        return []
+
+
+def collect(db_path: str, tail: int = 25) -> dict[str, Any]:
+    """Return a status snapshot dict, or an ``error`` dict if unreadable."""
+    conn = _connect(db_path)
+    if conn is None:
+        return {"db_path": db_path, "exists": False,
+                "note": "no event store at this path yet -- nothing has run"}
+    try:
+        breakers = _rows(conn, "SELECT * FROM breakers ORDER BY level, key")
+        agents = _rows(conn, "SELECT * FROM agent_instances ORDER BY updated_at DESC")
+        runs = _rows(conn, "SELECT * FROM workflow_runs ORDER BY updated_at DESC LIMIT 50")
+        tasks = _rows(conn, "SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 200")
+        task_counts = _rows(conn,
+            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status ORDER BY n DESC")
+        council = _rows(conn,
+            "SELECT id, subject_type, subject_ref, status, decision, confidence, "
+            "engraphis_ref, created_at FROM council_sessions "
+            "ORDER BY created_at DESC LIMIT 20")
+        events = _rows(conn,
+            "SELECT seq, type, aggregate_type, aggregate_id, correlation_id, "
+            "priority, created_at FROM events ORDER BY seq DESC LIMIT ?", (int(tail),))
+        event_counts = _rows(conn,
+            "SELECT type, COUNT(*) AS n FROM events GROUP BY type ORDER BY n DESC")
+
+        def _count(sql: str) -> int:
+            rows = _rows(conn, sql)
+            if rows and "c" in rows[0]:
+                return int(rows[0]["c"])
+            return 0
+
+        out = {
+            "db_path": db_path, "exists": True,
+            "breakers": breakers,
+            "breaker_any_open": any(b.get("state") == "OPEN" for b in breakers),
+            "agents": agents,
+            "workflow_runs": runs,
+            "task_counts": task_counts,
+            "recent_tasks": tasks,
+            "council_sessions": council,
+            "event_counts": event_counts,
+            "recent_events": events,
+            "total_events": _count("SELECT COUNT(*) AS c FROM events"),
         }
-    except Exception as e:
-        council_status["error"] = str(e)
-
-    # Workflow
-    workflow_status = {"registered": []}
-    try:
-        wf_engine = WorkflowEngine(db)
-        workflow_status = {
-            "registered": list(wf_engine._defs.keys()),
-        }
-    except Exception as e:
-        workflow_status["error"] = str(e)
-
-    # Event bus health
-    bus_health = {"connected": bus is not None}
-    if bus:
-        try:
-            recent = bus.query(limit=1)
-            bus_health["recent_events"] = len(recent)
-        except Exception as e:
-            bus_health["query_error"] = str(e)
-
-    return {
-        "orchestration_enabled": config.orchestration_enabled(),
-        "events_db": db,
-        "global_breaker_open": global_open,
-        "breakers": breaker_snapshot,
-        "council": council_status,
-        "workflows": workflow_status,
-        "bus": bus_health,
-    }
+        return out
+    finally:
+        conn.close()
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="agentic-system orchestration status / health check")
-    parser.add_argument("--json", action="store_true", help="JSON output")
-    args = parser.parse_args()
+def _fmt_human(s: dict[str, Any]) -> str:
+    if not s.get("exists"):
+        return f"orchestration status: {s.get('note', 'no DB')} ({s.get('db_path')})"
 
-    try:
-        status = collect_status()
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+    lines: list[str] = []
+    lines.append(f"=== orchestration status  ({s['db_path']}) ===")
+    lines.append(f"events: {s['total_events']} total; recent types: "
+                 + ", ".join(f"{e['type']}={e['n']}" for e in s["event_counts"][:8])
+                 or "events: 0")
 
-    if args.json:
-        json.dump(status, sys.stdout, indent=2)
-        print()
+    brk = s["breakers"]
+    if brk:
+        lines.append("")
+        lines.append("--- breakers ---")
+        for b in brk:
+            flag = "  <<< OPEN" if b.get("state") == "OPEN" else ""
+            lines.append(f"  {b['level']}/{b['key']}: {b.get('state')}"
+                         + (f"  reason={b.get('reason')}" if b.get("reason") else "")
+                         + flag)
+        if s["breaker_any_open"]:
+            lines.append("  ** at least one breaker OPEN -- high-impact tools blocked **")
     else:
-        print("=== agentic-system orchestration status ===")
-        print(f"enabled:        {status['orchestration_enabled']}")
-        print(f"events_db:      {status['events_db']}")
-        print(f"global_open:    {status['global_breaker_open']}")
-        print()
-        print("--- breakers ---")
-        for b in status["breakers"]:
-            print(f"  {b['level']:8} {b['key']:20} {b['state']}  ({b['reason']})")
-        print()
-        print(f"--- council ---")
-        c = status["council"]
-        if c.get("configured"):
-            print(f"  members:      {', '.join(c['members'])}")
-            print(f"  thresholds:   {c['thresholds']}")
-            print(f"  peer_eval:    {c['peer_eval']}")
-            print(f"  min_quorum:   {c['min_quorum']}")
-        else:
-            print(f"  not configured: {c.get('error')}")
-        print()
-        print(f"--- workflows ---")
-        for wf in status["workflows"].get("registered", []):
-            print(f"  {wf}")
+        lines.append("\n--- breakers: none recorded (all CLOSED) ---")
 
-    # Exit code: 1 if global breaker OPEN (health check failure)
-    return 1 if status["global_breaker_open"] else 0
+    ag = s["agents"]
+    lines.append("")
+    lines.append(f"--- agents ({len(ag)}) ---")
+    for a in ag[:20]:
+        hb = a.get("last_heartbeat_at") or "never"
+        lines.append(f"  {a['id']} [{a.get('role') or '-'}] {a.get('status')}"
+                     f" errs={a.get('error_count', 0)}"
+                     f" no_progress={a.get('no_progress_counter', 0)}"
+                     f" task={a.get('current_task_id') or '-'} hb={hb}")
+    if len(ag) > 20:
+        lines.append(f"  ... +{len(ag) - 20} more")
+
+    tc = s["task_counts"]
+    lines.append("")
+    lines.append("--- tasks ---")
+    if tc:
+        lines.append("  " + ", ".join(f"{t['status']}={t['n']}" for t in tc))
+    else:
+        lines.append("  (no tasks)")
+    stuck = [t for t in s["recent_tasks"] if t.get("status") in ("ASSIGNED", "WAITING_DEP")]
+    for t in stuck[:15]:
+        lines.append(f"  {t['status']} {t['id']} type={t['type']}"
+                     f" agent={t.get('assigned_agent_id') or '-'}"
+                     f" attempts={t.get('attempts', 0)}/{t.get('max_attempts', 3)}"
+                     f" updated={t.get('updated_at')}")
+
+    runs = s["workflow_runs"]
+    if runs:
+        lines.append("")
+        lines.append(f"--- workflow runs ({len(runs)} shown) ---")
+        for r in runs[:15]:
+            lines.append(f"  {r['id']} {r.get('workflow_name')} {r.get('status')}"
+                         f" node={r.get('current_node_id') or '-'}"
+                         f" updated={r.get('updated_at')}")
+
+    cs = s["council_sessions"]
+    if cs:
+        lines.append("")
+        lines.append(f"--- council sessions ({len(cs)} shown) ---")
+        for c in cs[:15]:
+            lines.append(f"  {c['id']} {c.get('status')} -> {c.get('decision')}"
+                         f" conf={c.get('confidence')}"
+                         + (f"  engraphis={c.get('engraphis_ref')}" if c.get("engraphis_ref") else ""))
+
+    ev = s["recent_events"]
+    lines.append("")
+    lines.append(f"--- recent events (last {len(ev)}) ---")
+    for e in ev:
+        corr = f" corr={e['correlation_id']}" if e.get("correlation_id") else ""
+        agg = f" {e['aggregate_type']}:{e['aggregate_id']}" if e.get("aggregate_type") else ""
+        pri = f" [{e['priority']}]" if e.get("priority") and e["priority"] != "normal" else ""
+        lines.append(f"  #{e['seq']} {e['type']}{agg}{corr}{pri}  {e.get('created_at')}")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m agentic_system.orchestration_status",
+                                 description="Read-only orchestration status")
+    ap.add_argument("--db", help="events DB path (default: orchestration events DB)")
+    ap.add_argument("--tail", type=int, default=25, help="recent events to show")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of text")
+    args = ap.parse_args(argv)
+    s = collect(_db_path(args.db), tail=args.tail)
+    if "error" in s:
+        print(json.dumps(s, ensure_ascii=False, indent=2) if args.json
+              else f"error: {s['error']}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(s, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(_fmt_human(s))
+    # non-zero exit when a breaker is OPEN -- useful for health checks/cron.
+    return 1 if s.get("breaker_any_open") else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

@@ -1,349 +1,233 @@
 # agentic-system
 
-> A framework-agnostic orchestration layer for autonomous agents:
-> circuit breakers, multi-LLM council (8 specialized gates), workflow FSM,
-> periodic sweeps, and a read-only status/health CLI — all behind swappable
-> host adapter ports so the layer drops into any Python agent runtime,
-> not just Hermes.
+A framework-agnostic **orchestration layer for autonomous agents**. Drop it into
+any Python agent runtime to get:
 
-**Version:** 0.3.0  
-**License:** MIT  
-**Python:** ≥3.11  
-**Core deps:** `pydantic≥2.8`, `PyYAML≥6.0` (stdlib + pydantic only)
+- **Durable event store** (SQLite WAL, append-only, replayable) — the system of record.
+- **Deterministic agent FSM** with per-state tool policy — *LLMs never control flow.*
+- **Three-level circuit breakers** (agent / workflow / global), persisted, with
+  high-impact-tool gating (deploy/push/publish, including commands inside `terminal`).
+- **No-progress loop detection** (stdlib difflib; pluggable embeddings upgrade).
+- **Workflow DAG engine** (CAS claiming, idempotent advance, restart-resume) + worker.
+- **Model Council** — deadline-bounded multi-model review, deterministic named
+  or custom gate policies, peer evaluation, safe caching, and optional Engraphis persistence.
+- **Periodic sweeps** — heartbeat / stuck-task recovery / metric watchdog / nightly consolidate.
+- **Read-only status / health CLI** — `python -m agentic_system.orchestration_status`
+  (exits non-zero when any breaker is OPEN, so it doubles as a health check).
 
----
-
-## What you get
-
-| Capability | Description |
-|------------|-------------|
-| **Durable event store** | SQLite WAL, append-only, replayable — the system of record. |
-| **Deterministic agent FSM** | Per-state tool policy — LLMs never control flow. |
-| **Three-level circuit breakers** | Agent / workflow / global, persisted, with high-impact-tool gating (deploy/push/publish, including inside `terminal`). Self-heal: global auto-recovers after cooldown; agent/workflow auto-close on success. |
-| **No-progress loop detection** | Stdlib `difflib` (catches verbatim loops). Optional semantic embeddings via `sentence-transformers` or custom callable (Engraphis cosine). |
-| **Model Council** (8 gates) | Parallel structured reviews → weighted verdict (APPROVE/REWORK/REJECT). Verdict cache, quorum, peer-eval for high risk, Engraphis persistence. **Gates:** `code_edit`, `pr_review`, `merge`, `delegation`, `security`, `code_quality`, `dependency`, `architecture`. |
-| **Workflow DAG engine** | CAS claiming, idempotent advance, restart-resume + background worker. |
-| **Periodic sweeps** | Heartbeat / stuck-task recovery / metric watchdog / nightly consolidate — registered via CronPort. |
-| **Status/health CLI** | `python -m agentic_system.orchestration_status` — exits non-zero when any breaker is OPEN (health-check ready). |
-
----
+The core depends only on the **stdlib + pydantic**. Everything host-specific
+(config, token budget, LLM, cron) is supplied through four **adapter ports** you
+implement — so it works with Hermes, your own agent, or a custom runtime.
 
 ## Install
 
-```bash
-# From GitHub (PyPI publication pending)
-pip install git+https://github.com/Coding-Dev-Tools/agentic-system.git
+**From GitHub** (available now — PyPI publication is the final pending step):
 
-# Optional extras
-pip install "agentic-system[engraphis]"      # council verdict persistence
-pip install "agentic-system[embeddings]"     # semantic no-progress detection
+```bash
+pip install agentic-system            # core: pydantic + PyYAML
+# pip install "agentic-system[engraphis]"   # optional: council verdict persistence (once Engraphis is on PyPI)
+# pip install "agentic-system[embeddings]"  # optional: semantic no-progress detection
 ```
 
----
+Until the package is on PyPI, install the wheel/sdist from the [releases page](https://github.com/Coding-Dev-Tools/agentic-system/releases), or from source:
 
-## Quick Start
+```bash
+pip install git+https://github.com/Coding-Dev-Tools/agentic-system.git
+# extras:
+pip install "agentic-system[embeddings] @ git+https://github.com/Coding-Dev-Tools/agentic-system.git"
+# council verdict persistence (install the companion from its GitHub first):
+pip install git+https://github.com/Coding-Dev-Tools/engraphis.git
+```
+
+## Wire it into your agent (the four ports)
 
 ```python
-# 1. Implement the four required ports for your runtime
 from agentic_system import ports
-from agentic_system.ports import ConfigPort, TokenBudgetPort, CronPort, LLMPort
 
-class MyConfig(ConfigPort):
-    def orchestration_enabled(self) -> bool: return True
-    def events_db_path(self) -> str: return "/data/agent_events.db"
-    def council_config(self) -> dict: return {
+class MyConfig:                       # implement ports.ConfigPort
+    def orchestration_enabled(self): return True
+    def events_db_path(self): return "/var/lib/myagent/events.db"
+    def council_config(self): return {                              # or None
         "members": [
-            {"id": "claude-sonnet-5", "provider": "anthropic", "weight": 1.1},
-            {"id": "gpt-4o", "provider": "openai", "weight": 1.0},
+            {"id": "reviewer-a", "provider": "mine", "weight": 1.0},
+            {"id": "reviewer-b", "provider": "mine", "weight": 1.0},
         ],
-        "thresholds": {"min_overall": 4.0, "min_safety": 4.5, "min_tests": 3.5,
-                       "min_agreement": 0.7, "reject_max_overall": 2.5},
-        "peer_eval": "high_risk_only",
-        "min_quorum": 2,
+        "thresholds": {"min_overall": 4.0, "min_safety": 4.5,
+                       "min_tests": 3.5, "min_agreement": 0.7,
+                       "reject_max_overall": 2.5},
+        "peer_eval": "high_risk_only", "min_quorum": 2,
+        "review_timeout_seconds": 60, "max_parallel_reviews": 8,
+        "max_content_chars": 100_000, "max_model_response_chars": 50_000,
     }
-    def state_tool_policy(self) -> dict: return {...}  # optional override
+    def state_tool_policy(self): return None
 
-class MyBudget(TokenBudgetPort):
-    def make(self, max_tokens: int):
-        return TokenBudget(max_tokens)  # your impl
+class MyBudget:                       # implement ports.TokenBudgetPort
+    def make(self, max_tokens): ...   # -> object with consume(tokens)/exceeded/used/max_total
 
-def my_llm(member, system, user) -> str:
-    return provider_call(member.id, system, user)  # your LLM router
+def my_llm(member, system, user, *, timeout_seconds):
+    ...  # pass timeout_seconds to the provider's HTTP/API timeout
 
 ports.set_config_port(MyConfig())
 ports.set_token_budget_port(MyBudget())
-ports.set_default_llm_fn(my_llm)
-ports.set_cron_port(MyCron())  # optional, for sweeps
+ports.set_default_llm_fn(my_llm)      # used by the council when no llm_fn is passed
+# ports.set_cron_port(MyCron())       # only needed if you use register_sweeps()
 ```
 
+## Use it
+
 ```python
-# 2. Use the orchestration layer
-from agentic_system.breakers import high_impact_block_message
-from agentic_system.no_progress import NoProgressDetector
-from agentic_system.council import CouncilService, CouncilRequest
+from agentic_system.events import hooks        # turn lifecycle / token-budget hooks
+from agentic_system.state_machine import AgentStateMachine, filter_tools
+from agentic_system.breakers import BreakerRegistry, high_impact_block_message
+from agentic_system.council import CouncilService, CouncilRequest, make_engraphis_persist_hook
+from agentic_system.workflow import WorkflowEngine, WorkflowWorker, load_directory
+from agentic_system import sweeps
 
-# Block high-impact tools when global breaker OPEN
-if msg := high_impact_block_message("terminal", {"command": "git push origin main"}):
-    raise PermissionError(msg)
+# emit turn events (no-op when orchestration_enabled() is False; never raises)
+hooks.emit_turn_started(agent, task_id)
+hooks.record_usage_ok(agent, total_tokens)
+hooks.emit_turn_completed(agent, task_id, api_calls, total_tokens)
 
-# Detect no-progress loops
-detector = NoProgressDetector(window=3, threshold=0.9)
-if detector.record(agent_output):
-    print("Loop detected!")
+# gate high-impact tools when the global breaker is OPEN
+if high_impact_block_message(tool_name, tool_args): ...  # refuse
 
-# Run a council review
-council = CouncilService(db_path="/data/events.db")
-decision = council.review(CouncilRequest(
-    subject_type="CODE_EDIT",
-    subject_ref={"repo": "myrepo", "file": "foo.py"},
-    content=diff_text,
-    risk_level="medium",
-    gate="code_edit",
+# run a deadline-bounded PR review under a deterministic gate policy
+svc = CouncilService(
+    db_path, persist_hook=make_engraphis_persist_hook(),
+    review_timeout_seconds=60,
+)
+decision = svc.review(CouncilRequest(
+    subject_type="PR", content=diff, risk_level="medium", gate="pr_review",
 ))
-print(decision.decision, decision.metrics)
+
+# run a workflow DAG to completion
+engine = WorkflowEngine(db_path, definitions=load_directory())
+worker = WorkflowWorker("agent-1", engine, handlers={"CODEGEN": my_codegen, ...})
+while worker.run_once(): pass
+
+# inspect the whole system
+# $ python -m agentic_system.orchestration_status
 ```
 
----
+## Council gates and deadlines
 
-## Architecture
+Built-in gates are `code_edit`, `pr_review`, `merge`, `delegation`, `security`,
+`code_quality`, `dependency`, and `architecture`. Each declares its exact
+dimensions, whether higher or lower scores are better, and approval floors.
+`GatePolicy` and `DimensionPolicy` provide the same contract for host-specific
+gates; policy checks run in Python after model output validation.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  HOST RUNTIME (Hermes / your agent / custom)                │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │  Adapter seam (ports.py)                                │ │
-│  │  ConfigPort • TokenBudgetPort • LLMPort • CronPort      │ │
-│  │  EngraphisPort (optional)                               │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        ▼                   ▼                   ▼
-┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-│   Events      │  │  State        │  │  Council      │
-│   (SQLite     │  │  Machine      │  │  (8 gates)    │
-│    WAL + bus) │  │  (per-state   │  │  cache/quorum │
-└───────────────┘  │   tool policy)│  └───────────────┘
-        ▲          └───────────────┘           ▲
-        │                  ▲                   │
-        │          ┌───────┴───────┐           │
-        │          │  Workflow     │           │
-        │          │  DAG Engine   │           │
-        │          │  (CAS claim,  │           │
-        │          │   idempotent) │           │
-        │          └───────────────┘           │
-        │                  ▲                   │
-        └──────────────────┼───────────────────┘
-                           ▼
-              ┌───────────────────────┐
-              │  Circuit Breakers     │
-              │  (agent/wf/global)    │
-              │  + high-impact gate   │
-              └───────────────────────┘
-                           ▲
-                           │
-              ┌───────────────────────┐
-              │  Periodic Sweeps      │
-              │  (heartbeat, stuck    │
-              │   recovery, watchdog, │
-              │   nightly consolidate)│
-              └───────────────────────┘
-```
-
----
-
-## Core Modules
-
-### `agentic_system.ports` — Adapter seam
-Register your runtime's config, token budget, LLM router, cron, and optional Engraphis at startup.
+Tool-backed facts belong in `evidence_scores`. They override every model's score
+for that dimension. The `merge` gate requires host-derived `ci_status` and
+`branch_protection` scores, so model claims cannot turn failed CI into approval:
 
 ```python
-from agentic_system.ports import (
-    set_config_port, set_token_budget_port,
-    set_default_llm_fn, set_cron_port, set_engraphis_port,
-)
-```
-
-### `agentic_system.events` — Durable event store + bus
-- `EventBus` — in-process pub/sub with SQLite persistence
-- `Event` — typed envelope (aggregate_id, correlation_id, priority)
-- `connect()`, `ensure_state_tables()` — schema for breakers, council, workflow
-
-### `agentic_system.state_machine` — Deterministic FSM
-```python
-from agentic_system.state_machine import AgentState, InvalidTransition
-state = AgentState("PLANNING")
-state.transition("EXECUTING", reason="plan approved")
-state.can_use_tool("terminal")  # True/False per state policy
-```
-
-### `agentic_system.breakers` — Three-level circuit breakers
-```python
-from agentic_system.breakers import get_registry, high_impact_block_message
-
-reg = get_registry()
-reg.open("agent", "worker-42", "repeated failures")
-reg.snapshot()  # list all breakers
-
-# Tool gate (call before every high-impact tool)
-if msg := high_impact_block_message(tool_name, tool_args):
-    raise PermissionError(msg)
-```
-
-### `agentic_system.no_progress` — Loop detection
-```python
-from agentic_system.no_progress import NoProgressDetector, make_embedding_similarity
-
-# Stdlib (verbatim/near-verbatim)
-det = NoProgressDetector(window=3, threshold=0.9)
-
-# Semantic (requires [embeddings] extra or custom callable)
-det = NoProgressDetector(similarity=make_embedding_similarity())
-```
-
-### `agentic_system.council` — Model Council (8 gates)
-```python
-from agentic_system.council import CouncilService, CouncilRequest
-
-council = CouncilService(
-    db_path="/data/events.db",
-    persist_hook=make_engraphis_persist_hook("hermes-council"),
-)
-
-decision = council.review(CouncilRequest(
-    subject_type="CODE_EDIT",
-    subject_ref={"repo": "acme", "file": "auth.py"},
+request = CouncilRequest(
+    subject_type="MERGE",
+    subject_ref={"repo": "org/project", "pr": 42},
     content=diff,
-    risk_level="high",
-    gate="code_edit",           # selects rubric dimensions
-    checklist=["no secrets", "tests updated"],
-))
-# decision.decision ∈ {APPROVE, REWORK, REJECT}
-```
-
-**Gates & rubric dimensions:**
-| Gate | Dimensions |
-|------|------------|
-| `code_edit` | correctness, safety, style, tests, minimal_change |
-| `pr_review` | correctness, safety, tests, documentation, scope |
-| `merge` | correctness, safety, tests, ci_status, branch_protection |
-| `delegation` | feasibility, clarity, risk, dependencies, value |
-| `security` | vuln_severity, exploitability, fix_correctness, blast_radius, compliance |
-| `code_quality` | complexity, duplication, test_coverage, documentation, maintainability |
-| `dependency` | vulnerability, license_compliance, version_freshness, supply_chain, breaking_changes |
-| `architecture` | cohesion, coupling, scalability, observability, evolution |
-
-### `agentic_system.workflow` — DAG engine
-```python
-from agentic_system.workflow import WorkflowEngine, TaskDef, WorkflowDef
-
-engine = WorkflowEngine("/data/events.db")
-engine.register_executor("lint", lambda inputs: {"report": run_linter(inputs["files"])})
-
-wf = WorkflowDef("code_review", tasks=(
-    TaskDef("lint", outputs=("lint_report",)),
-    TaskDef("type_check", outputs=("type_report",)),
-    TaskDef("test", inputs=("lint_report", "type_report"), outputs=("test_report",)),
-))
-inst = engine.create_instance(wf, {"files": ["src/"]})
-```
-
-Background worker:
-```bash
-python -m agentic_system.workflow.worker worker-0
-```
-
-### `agentic_system.sweeps` — Periodic sweeps
-```python
-from agentic_system.sweeps import register_sweeps
-register_sweeps()  # writes scripts to CronPort.scripts_dir(), registers jobs
-```
-Built-in sweeps:
-- `heartbeat` (5m) — agent liveness + work-log
-- `stuck_task_recovery` (10m) — re-queue stalled workflow tasks
-- `metric_watchdog` (5m) — breaker OPEN, queue depth, error rate → ALERT.md
-- `nightly_consolidate` (3 AM) — archive old events, vacuum DB
-
-### `agentic_system.orchestration_status` — Health CLI
-```bash
-python -m agentic_system.orchestration_status
-# JSON for monitoring:
-python -m agentic_system.orchestration_status --json
-```
-Exit codes: `0=healthy`, `1=breaker OPEN`, `2=sweeps overdue`, `3=bus error`, `4=disabled`.
-
----
-
-## Configuration (host-supplied via ConfigPort)
-
-```yaml
-council:
-  members:
-    - id: "claude-sonnet-5"
-      provider: "anthropic"
-      weight: 1.1
-    - id: "gpt-4o"
-      provider: "openai"
-      weight: 1.0
-  thresholds:
-    min_overall: 4.0
-    min_safety: 4.5
-    min_tests: 3.5
-    min_agreement: 0.7
-    reject_max_overall: 2.5
-  peer_eval: "high_risk_only"   # never | high_risk_only | always
-  min_quorum: 2
-
-# Optional: self-heal tuning
-breakers:
-  global_auto_recover_seconds: 300
-  agent_auto_close_on_success: true
-  workflow_auto_close_on_success: true
-
-# Optional: no-progress
-no_progress:
-  window: 3
-  threshold: 0.9
-  # embedding backend auto-detected; or set explicitly:
-  # embedding_backend: "sentence-transformers"
-```
-
----
-
-## Engraphis Integration (council verdict persistence)
-
-```python
-from agentic_system.council import make_engraphis_persist_hook
-from agentic_system.council import CouncilService
-
-council = CouncilService(
-    db_path="/data/events.db",
-    persist_hook=make_engraphis_persist_hook("hermes-council"),
+    gate="merge",
+    evidence={"ci_url": ci_url, "required_checks": required_checks},
+    evidence_scores={"ci_status": 5, "branch_protection": 5},
 )
+decision = svc.review(request)
 ```
-Verdicts land in Engraphis namespace `hermes-council` as `kind=council_verdict` episodic memories — available for `engraphis_why`, `engraphis_timeline`, `engraphis_recall_grounded`.
 
----
+`review_timeout_seconds` is one shared deadline across review and peer-evaluation
+calls. Adapters accepting the keyword-only `timeout_seconds` argument can cancel
+provider I/O cooperatively. Legacy three-argument adapters remain compatible;
+their late calls are discarded and cannot delay the returned verdict, but may
+finish in a background thread. Per-member outcomes distinguish `success`,
+`timeout`, `provider_error`, `invalid_output`, and `cooldown`. Only complete
+sessions are cached; cache identity includes policy, risk, thresholds, model
+providers and weights, while `cache_ttl_seconds=0` disables replay.
+Cache hits set `cached=True` while preserving the original decision reason.
 
-## Development
+## Status / health check
 
 ```bash
-git clone https://github.com/Coding-Dev-Tools/agentic-system.git
-cd agentic-system
-pip install -e ".[dev]"
-ruff check .
-mypy agentic_system
-pytest -v
+python -m agentic_system.orchestration_status          # human summary
+python -m agentic_system.orchestration_status --json   # machine-readable
+python -m agentic_system.orchestration_status --db /path/events.db --tail 50
+# exit code 1 when any breaker is OPEN -> usable as a cron health check
 ```
 
----
+## Sweeps
 
-## Extracted from Hermes
+```python
+from agentic_system.sweeps import (
+    heartbeat_sweep, stuck_task_sweep, metric_watchdog,
+    breaker_recovery_sweep, daily_consolidate)
+heartbeat_sweep()          # stale agents -> UNRESPONSIVE, CAS their tasks back to PENDING
+daily_consolidate()        # archive-then-prune old events to _archive/
+# or run from the CLI:
+# $ python -m agentic_system.sweeps heartbeat
+```
 
-This package is the **framework-agnostic core** extracted from the [Hermes agent](https://github.com/Coding-Dev-Tools/hermes-agent). Hermes implements the five ports against its config system (`hermes_cli.config`), token budget (`iteration_budget.TokenBudget`), cron (`cron.jobs`), auxiliary LLM client, and Engraphis MCP server.
+The `metric_watchdog` **trips** circuit breakers from failure metrics;
+`breaker_recovery_sweep` **self-heals** them (OPEN -> HALF_OPEN after a cooldown,
+then HALF_OPEN -> CLOSED on a clean probe, or re-OPEN if failures continue) —
+without it, a tripped breaker stays OPEN until a manual `close()`.
 
----
+Register all of them as periodic jobs via `register_sweeps()` (needs a `CronPort`).
 
-## License
+## Using with Engraphis (the companion memory engine)
 
-MIT — see [LICENSE](LICENSE).
+[Engraphis](https://github.com/Coding-Dev-Tools/engraphis) is a local-first AI memory engine. agentic-system
+works hand-in-hand with it via a single hook — council verdicts persist to
+Engraphis as durable `council_verdict` memories (episodic, workspace-scoped) so
+they show up in recall/why/timeline alongside everything else your agent knows.
+
+```bash
+pip install git+https://github.com/Coding-Dev-Tools/agentic-system.git   # the orchestration layer
+pip install git+https://github.com/Coding-Dev-Tools/engraphis.git          # the memory engine (base install is enough)
+# (replace with `pip install agentic-system` / `pip install engraphis` once both are on PyPI)
+```
+
+```python
+from agentic_system.council import CouncilService, CouncilRequest, make_engraphis_persist_hook
+
+svc = CouncilService(db_path, persist_hook=make_engraphis_persist_hook())
+decision = svc.review(CouncilRequest(subject_type="PR", content=diff, risk_level="medium"))
+# decision is now also a durable Engraphis memory you can recall/why/timeline.
+```
+
+Zero-config: `make_engraphis_persist_hook()` writes to Engraphis's default DB
+(`ENGRAPHIS_DB_PATH`), auto-creates the `hermes-council` workspace, and **never
+crashes the council** — if Engraphis isn't installed or can't be built, the hook
+becomes a no-op and logs a warning. Real semantic recall needs `engraphis[mcp]`;
+the base install uses a deterministic embedder fallback (still durable, just not
+semantic-search-ranked).
+
+### Optional: semantic no-progress detection
+
+The default `NoProgressDetector` uses difflib (catches verbatim loops). For
+semantic looping, back it with embeddings — either sentence-transformers or
+your own callable against Engraphis's embedder:
+
+```bash
+pip install "agentic-system[embeddings]"   # adds sentence-transformers
+```
+```python
+from agentic_system.no_progress import NoProgressDetector
+from agentic_system.embedding_similarity import make_embedding_similarity
+det = NoProgressDetector(window=3, threshold=0.9, similarity=make_embedding_similarity())
+# or build your own:  det = NoProgressDetector(similarity=my_engraphis_cosine)
+```
+
+## Design invariants
+
+- **LLMs never control flow** — only named FSM events / engine methods move state.
+- **Events appended after state-table commits** (SQLite write-lock discipline).
+- **Never delete** — event pruning archives JSONL first.
+- **High-impact tools** (deploy/push/publish, incl. inside `terminal`) are refused
+  while the global breaker is OPEN.
+- **Graceful no-op** — with no ports registered the layer is inert and never raises.
+
+## Status
+
+Extracted from the Hermes agent's orchestration layer and made framework-agnostic.
+Hermes is the reference consumer (its adapter implements the four ports against
+`hermes_cli.config`, `auxiliary_client`, `cron.jobs`, `iteration_budget`).
+
+License: MIT.

@@ -185,14 +185,55 @@ def test_council_constructor_args_override_config(restore, tmp_path):
     ports.set_config_port(_FakeConfigPort(council={
         "members": [{"id": "cfg-model", "weight": 1.0}],
         "thresholds": {"min_overall": 2.0},
-        "peer_eval": "never", "min_quorum": 1}))
+        "peer_eval": "never", "min_quorum": 2}))
     from agentic_system.council import CouncilService
     svc = CouncilService(
         str(tmp_path / "p.db"),
         members=[{"id": "ctor-model", "weight": 1.0}],
-        thresholds={"min_overall": 4.5}, peer_eval="always", min_quorum=5)
+        thresholds={"min_overall": 4.5}, peer_eval="always", min_quorum=1)
     assert [m.id for m in svc.members] == ["ctor-model"]
     assert svc.thresholds.min_overall == 4.5
     assert svc.peer_eval == "always"        # ctor wins (previously config won here)
-    assert svc.min_quorum == 5              # ctor wins (previously config won here)
+    assert svc.min_quorum == 1              # ctor wins (previously config won here)
     svc.close()
+
+
+def test_council_nullable_config_entries_use_defaults(restore, tmp_path):
+    ports.set_config_port(_FakeConfigPort(council={
+        "members": [{"id": "model-a"}, {"id": "model-b"}],
+        "thresholds": None,
+        "peer_eval": None,
+        "min_quorum": None,
+        "review_timeout_seconds": None,
+        "max_parallel_reviews": None,
+        "max_content_chars": None,
+        "max_model_response_chars": None,
+    }))
+    from agentic_system.council import CouncilService
+
+    svc = CouncilService(
+        str(tmp_path / "nullable-config.db"),
+        llm_fn=lambda member, system, user: "{}",
+    )
+
+    assert [member.id for member in svc.members] == ["model-a", "model-b"]
+    assert svc.thresholds.min_overall == 4.0
+    assert svc.peer_eval == "high_risk_only"
+    assert svc.min_quorum == 2
+    assert svc.review_timeout_seconds == 60.0
+    assert svc.max_parallel_reviews == 8
+    assert svc.max_content_chars == 100_000
+    assert svc.max_model_response_chars == 50_000
+    svc.close()
+
+
+def test_council_propagates_registered_config_port_errors(restore, tmp_path):
+    class BrokenConfigPort(_FakeConfigPort):
+        def council_config(self):
+            raise LookupError("config backend unavailable")
+
+    ports.set_config_port(BrokenConfigPort())
+    from agentic_system.council import CouncilService
+
+    with pytest.raises(LookupError, match="config backend unavailable"):
+        CouncilService(str(tmp_path / "broken-config.db"))

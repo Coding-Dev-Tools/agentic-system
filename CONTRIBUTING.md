@@ -1,83 +1,75 @@
 # Contributing to agentic-system
 
-Thank you for your interest in contributing! This project follows a standard GitHub workflow.
+Thanks for your interest in improving agentic-system! This is a small,
+focused library, so contributions that keep it **framework-agnostic, dependency-
+light, and well-tested** are the most welcome.
 
-## Development Setup
+## Ground rules
+
+- **The core depends only on the stdlib + pydantic (+ PyYAML for workflow
+  YAML).** Don't add a hard dependency to the core; gate optional integration
+  (Engraphis, sentence-transformers) behind an install extra.
+- **No host-specific imports in the core.** Anything a host supplies (config,
+  token budget, LLM client, cron) goes through one of the four ports in
+  `agentic_system/ports.py` (`ConfigPort` / `TokenBudgetPort` / `LLMPort` /
+  `CronPort`).
+- **LLMs never control flow.** Only named FSM events / engine methods move
+  state. Model output is data.
+
+## Development
 
 ```bash
-# Clone and install in development mode
 git clone https://github.com/Coding-Dev-Tools/agentic-system.git
 cd agentic-system
-pip install -e ".[dev]"
+python -m venv .venv && .venv/Scripts/activate   # or: source .venv/bin/activate
+pip install -e ".[test]"
+pytest                       # 114 tests, ~30s
+ruff check agentic_system tests examples   # lint (syntax errors + pyflakes)
 ```
 
-## Code Quality
-
-We enforce strict quality standards:
+For the optional integrations:
 
 ```bash
-# Format
-ruff format agentic_system tests
-
-# Lint
-ruff check agentic_system tests
-
-# Type check
-mypy agentic_system
-
-# Tests
-pytest -v --cov=agentic_system --cov-fail-under=80
+pip install -e ".[test,embeddings]"     # semantic no-progress test runs
+# engraphis tests use pytest.importorskip("engraphis"), so they skip unless
+# the companion is installed.
 ```
 
-All CI checks must pass before merge.
+## Before you open a PR
 
-## Architecture Principles
+1. **Tests pass** — `pytest tests/ -q`. Add tests for any new behavior; we aim
+   to keep coverage high (currently ~91%).
+2. **Lint passes** — `ruff check agentic_system tests examples` is clean (the
+   config is in `pyproject.toml`: `E9` + `F`).
+3. **No build artifacts committed** — `dist/`, `*.whl`, `*.tar.gz` are
+   gitignored; the CI `build` job asserts nothing leaks. Run `python -m build`
+   locally if you change packaging.
+4. **Public API changes** are reflected in the README and `CHANGELOG.md`.
+5. **Keep docstrings self-contained** — no internal-design-doc citations or
+   host-specific vocabulary in the core (`agent.orchestration_ports`,
+   `hermes_events.db`, etc. belong to a host, not here).
 
-1. **Framework-agnostic**: Core depends only on stdlib + pydantic. Host-specific code lives in adapter ports.
-2. **No hidden control flow**: LLMs never move state — only FSM events / engine methods do.
-3. **Durability first**: Events are append-only, never deleted. Pruning archives to JSONL first.
-4. **Graceful no-op**: With no ports registered, the layer is inert and never raises.
-5. **Observability built-in**: Structured logging, Prometheus metrics, OTel tracing, health checks.
+## Commit + PR style
 
-## Adding a New Council Gate
+- Small, focused commits with a clear message (`feat:`, `fix:`, `docs:`,
+  `test:`, `chore:`, `refactor:`).
+- One logical change per PR. Rebase onto `main` before requesting review.
 
-1. Add gate name to `GATE_DIMENSIONS` in `council/schemas.py`
-2. Add gate-specific system prompt in `council/service.py` (`GATE_SYSTEMS`)
-3. Add test in `tests/test_council.py`
-4. Document in `README.md` gates table
+## Reporting issues
 
-## Adding a New Sweep
+Open a [GitHub issue](https://github.com/Coding-Dev-Tools/agentic-system/issues)
+with the agentic-system version (`python -c "import agentic_system; print(agentic_system.__version__)"`),
+Python version, a minimal repro, and what you expected vs. got. For security
+issues, see `SECURITY.md` (don't open a public issue).
 
-1. Add sweep definition to `SCRIPTS` in `sweeps.py`
-2. Write script with `main()` that exits 0 on success, non-zero on failure
-3. Add test in `tests/test_register_sweeps.py`
-4. Document in `README.md`
+## Releasing
 
-## Adding a New Port Method
+1. Bump `version` in `pyproject.toml` + add a `CHANGELOG.md` entry.
+2. Tag (`git tag v0.x.0 && git push --tags`).
+3. `python -m build && python -m twine upload dist/*` (maintainers).
+4. Publish a GitHub Release from the tag with the built artifacts attached.
 
-1. Define new `Protocol` in `ports.py`
-2. Add getter/setter/reset in `ports.py`
-3. Update `reset_ports_for_tests()`
-4. Document in `README.md` and `MIGRATION_GUIDE.md`
+## License
 
-## Testing Guidelines
-
-- Unit tests for pure logic (state machine, breakers, no-progress)
-- Integration tests for DB-backed components (council, workflow, events)
-- Mock host ports using `FakeConfigPort`, `FakeTokenBudgetPort`, etc.
-- Test both sync and async paths where applicable
-
-## Release Process
-
-1. Update `CHANGELOG.md` with new version
-2. Bump version in `pyproject.toml` and `agentic_system/__init__.py`
-3. Tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-4. GitHub Actions builds and publishes to PyPI
-
-## Code of Conduct
-
-See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Be respectful, inclusive, and constructive.
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+By contributing you agree your contributions are licensed MIT, same as the rest
+of the project.
