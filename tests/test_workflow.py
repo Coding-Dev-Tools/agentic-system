@@ -76,22 +76,26 @@ def test_linear_run_end_to_end(tmp_path):
     for expected in ["workflow.run_started", "workflow.node_ready", "task.created",
                      "task.claimed", "task.completed", "workflow.run_completed"]:
         assert expected in types
-    store.close(); eng.close()
+    store.close()
+    eng.close()
 
 
 def test_diamond_join_gates_on_both_legs(tmp_path):
     eng = _engine(tmp_path)
     run_id = eng.start_run("diamond")
     code = eng.list_tasks(run_id)[0]
-    eng.claim_task(code["id"], "a1"); eng.complete_task(code["id"])
+    eng.claim_task(code["id"], "a1")
+    eng.complete_task(code["id"])
     by_node = {t["node_id"]: t for t in eng.list_tasks(run_id)}
     assert by_node["tests"]["status"] == "PENDING"
     assert by_node["lint"]["status"] == "PENDING"
     assert "review" not in by_node
-    eng.claim_task(by_node["tests"]["id"], "a1"); eng.complete_task(by_node["tests"]["id"])
+    eng.claim_task(by_node["tests"]["id"], "a1")
+    eng.complete_task(by_node["tests"]["id"])
     assert "review" not in {t["node_id"] for t in eng.list_tasks(run_id)}  # lint pending
     by_node = {t["node_id"]: t for t in eng.list_tasks(run_id)}
-    eng.claim_task(by_node["lint"]["id"], "a1"); eng.complete_task(by_node["lint"]["id"])
+    eng.claim_task(by_node["lint"]["id"], "a1")
+    eng.complete_task(by_node["lint"]["id"])
     by_node = {t["node_id"]: t for t in eng.list_tasks(run_id)}
     assert by_node["review"]["status"] == "PENDING"  # join satisfied
     eng.close()
@@ -111,7 +115,8 @@ def test_fail_requeue_then_exhaust_fails_run(tmp_path):
     eng = _engine(tmp_path)
     run_id = eng.start_run("linear")
     a = eng.list_tasks(run_id)[0]
-    eng.claim_task(a["id"], "w1"); eng.complete_task(a["id"])
+    eng.claim_task(a["id"], "w1")
+    eng.complete_task(a["id"])
     b = next(t for t in eng.list_tasks(run_id) if t["node_id"] == "b")
     eng.claim_task(b["id"], "w1")
     assert eng.fail_task(b["id"], "flaky test") == "requeued"  # attempt 1/2
@@ -123,7 +128,8 @@ def test_fail_requeue_then_exhaust_fails_run(tmp_path):
     types = [e.type for _, e in store.read_since(0)]
     assert "council.escalation_requested" in types
     assert "workflow.run_failed" in types
-    store.close(); eng.close()
+    store.close()
+    eng.close()
 
 
 def test_restart_resume_from_tables(tmp_path):
@@ -131,7 +137,8 @@ def test_restart_resume_from_tables(tmp_path):
     eng1 = _engine(tmp_path)
     run_id = eng1.start_run("linear", {"repo": "demo"})
     a = eng1.list_tasks(run_id)[0]
-    eng1.claim_task(a["id"], "w1"); eng1.complete_task(a["id"])
+    eng1.claim_task(a["id"], "w1")
+    eng1.complete_task(a["id"])
     assert eng1.get_run(run_id)["current_node_id"] == "b"
     eng1.close()  # simulate process restart
 
@@ -161,7 +168,8 @@ def test_breaker_blocks_start_and_claim(tmp_path):
         eng.start_run("linear")
     breakers.close("global", GLOBAL_KEY)
     assert eng.claim_task(t["id"], "w1")
-    breakers.close_conn(); eng.close()
+    breakers.close_conn()
+    eng.close()
 
 
 # ── worker ────────────────────────────────────────────────────────────────
@@ -183,7 +191,9 @@ def test_worker_runs_workflow_to_completion(tmp_path):
     store = EventStore(eng.db_path)
     types = [e.type for _, e in store.read_since(0)]
     assert "agent.state_changed" in types  # FSM wired to the bus
-    store.close(); w.close(); eng.close()
+    store.close()
+    w.close()
+    eng.close()
 
 
 def test_worker_failure_goes_to_cooldown_and_requeues(tmp_path):
@@ -203,7 +213,8 @@ def test_worker_failure_goes_to_cooldown_and_requeues(tmp_path):
     assert t["status"] == "PENDING" and t["attempts"] == 1
     # cooldown elapsed (0s) -> can work again
     assert w.fsm.can_accept_task()
-    w.close(); eng.close()
+    w.close()
+    eng.close()
 
 
 def test_worker_materializes_terminal_idle_state(tmp_path):
@@ -218,10 +229,13 @@ def test_worker_materializes_terminal_idle_state(tmp_path):
     while w.run_once():
         pass
     assert eng.get_run(run_id)["status"] == "COMPLETED"
-    conn = connect(eng.db_path); ensure_state_tables(conn)
+    conn = connect(eng.db_path)
+    ensure_state_tables(conn)
     row = conn.execute("SELECT status FROM agent_instances WHERE id=?",
                        ("worker-idle",)).fetchone()
-    conn.close(); w.close(); eng.close()
+    conn.close()
+    w.close()
+    eng.close()
     assert row is not None
     assert row["status"] == "IDLE"
 
@@ -237,10 +251,13 @@ def test_worker_materializes_cooldown_state_on_failure(tmp_path):
                         {"CODEGEN": _boom, "TEST": lambda t: "mem"},
                         cooldown_seconds=60.0)
     w.run_once()
-    conn = connect(eng.db_path); ensure_state_tables(conn)
+    conn = connect(eng.db_path)
+    ensure_state_tables(conn)
     row = conn.execute("SELECT status FROM agent_instances WHERE id=?",
                        ("worker-fail",)).fetchone()
-    conn.close(); w.close(); eng.close()
+    conn.close()
+    w.close()
+    eng.close()
     assert row is not None and row["status"] == "COOLDOWN"
 
 
@@ -275,4 +292,5 @@ def test_worker_no_progress_drives_dedicated_fsm_event(tmp_path):
     evs = [e for _, e in EventStore(eng.db_path).read_since(
         0, types=("task.failed", "task.requeued"))]
     assert evs and "no_progress" in (evs[-1].payload.get("reason") or "")
-    w.close(); eng.close()
+    w.close()
+    eng.close()
