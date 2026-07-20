@@ -198,6 +198,8 @@ GATE_POLICIES: Mapping[str, GatePolicy] = MappingProxyType({
 class CouncilMember(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
     id: str                       # model id, e.g. "claude-sonnet-5"
+    model: Optional[str] = None   # alias for id (multi-persona configs)
+    role: Optional[str] = None    # persona role, e.g. "orchestrator", "reviewer"
     provider: Optional[str] = None
     weight: float = 1.0
     base_url: Optional[str] = None   # for custom/OpenAI-compatible providers
