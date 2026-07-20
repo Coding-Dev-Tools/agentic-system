@@ -40,6 +40,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import time
 import threading
 import uuid
@@ -125,14 +126,93 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    result = json.loads(
-        (text or "").strip(),
-        object_pairs_hook=_unique_json_object,
-        parse_constant=_reject_json_constant,
+    """Parse a JSON object from model output.
+
+    Thinking models (qwen-3.8-thinking, etc.) often produce reasoning text
+    before the JSON and may wrap it in markdown code blocks. This parser
+    handles all three cases:
+    1. Raw JSON (the whole text is the JSON object)
+    2. JSON embedded in text (find the first { ... } block)
+    3. JSON in a markdown code block (```json ... ``` or ``` ... ```)
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty model output")
+
+    # Case 1: try parsing the whole text as JSON
+    try:
+        result = json.loads(
+            raw, object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant)
+        if not isinstance(result, dict):
+            raise ValueError("model output must be one JSON object")
+        return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Case 2: strip markdown code blocks (```json ... ``` or ``` ... ```)
+    code_block_patterns = [
+        r"```(?:json)?\s*\n(.*?)\n\s*```",  # ```json\n...\n``` or ```\n...\n```
+        r"```(?:json)?\s*(.*?)\s*```",       # same but without newlines
+    ]
+    for pattern in code_block_patterns:
+        match = re.search(pattern, raw, re.DOTALL)
+        if match:
+            try:
+                result = json.loads(
+                    match.group(1).strip(),
+                    object_pairs_hook=_unique_json_object,
+                    parse_constant=_reject_json_constant)
+                if isinstance(result, dict):
+                    return result
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    # Case 3: find the first balanced { ... } block in the text
+    # (thinking models produce reasoning before the JSON)
+    start = raw.find("{")
+    if start != -1:
+        # Find the matching closing brace by counting nesting
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        result = json.loads(
+                            raw[start:i + 1],
+                            object_pairs_hook=_unique_json_object,
+                            parse_constant=_reject_json_constant)
+                        if isinstance(result, dict):
+                            return result
+                    except (json.JSONDecodeError, ValueError):
+                        # Try the next { ... } block
+                        start = raw.find("{", i + 1)
+                        if start == -1:
+                            break
+                        depth = 0
+                        i = start - 1  # will be incremented by loop
+
+    raise ValueError(
+        f"no valid JSON object found in model output "
+        f"(length={len(raw)}, first 100 chars: {raw[:100]!r})"
     )
-    if not isinstance(result, dict):
-        raise ValueError("model output must be one JSON object")
-    return result
 
 
 @dataclass(frozen=True)
