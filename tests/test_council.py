@@ -263,6 +263,8 @@ def test_make_engraphis_persist_hook_real_round_trip(tmp_path, monkeypatch):
     pytest.importorskip("engraphis")
     db = tmp_path / "engraphis_hook.db"
     monkeypatch.setenv("ENGRAPHIS_DB_PATH", str(db))
+    # Ensure no workspace restriction leaks from the host environment
+    monkeypatch.delenv("ENGRAPHIS_WORKSPACES", raising=False)
     from agentic_system.council.service import make_engraphis_persist_hook
     hook = make_engraphis_persist_hook()
     # if engraphis import failed the hook degrades to a no-op lambda — skip
