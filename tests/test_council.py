@@ -11,9 +11,9 @@ from agentic_system.events.bus import EventBus
 from agentic_system.events.store import EventStore
 
 MEMBERS = [
-    {"id": "model-a", "weight": 1.1},
-    {"id": "model-b", "weight": 1.0},
-    {"id": "model-c", "weight": 0.9},
+    {"id": "model-a", "provider": "provider-a", "weight": 1.1},
+    {"id": "model-b", "provider": "provider-b", "weight": 1.0},
+    {"id": "model-c", "provider": "provider-c", "weight": 0.9},
 ]
 
 
@@ -53,6 +53,59 @@ def test_unanimous_approve(tmp_path):
     assert d.decision == "APPROVE"
     assert d.metrics["agreement"] == 1.0
     assert set(d.per_model) == {"model-a", "model-b", "model-c"}
+    assert d.per_model["model-a"]["provider"] == "provider-a"
+    assert d.per_model["model-a"]["weight"] == 1.1
+    assert d.metrics["configured_weight"] == 3.0
+    assert d.metrics["completed_weight"] == 3.0
+    assert d.metrics["approving_weight"] == 3.0
+    svc.close()
+
+
+def test_evidence_rich_review_survives_aggregation(tmp_path):
+    prompts = []
+
+    def llm(member, system, user):
+        prompts.append((system, user))
+        return json.dumps({
+            "self_scores": GOOD,
+            "recommendation": "approve_with_nits",
+            "rationale": (
+                "The retry guard addresses the duplicate-send root cause, but "
+                "the live provider path remains unverified."
+            ),
+            "strengths": [{
+                "claim": "Retry side effects are now idempotent.",
+                "evidence": "scheduler.py:214 and test_retry_side_effects",
+            }],
+            "findings": [{
+                "severity": "risk",
+                "problem": "The live provider response is not exercised.",
+                "evidence": "Only the deterministic unit test appears in ARTIFACT.",
+                "action": "Run one provider smoke before merge.",
+            }],
+            "tests_observed": [
+                "test_retry_side_effects proves one send across a retry",
+            ],
+            "test_gaps": ["No live provider smoke is present."],
+            "residual_risks": ["One additional model round trip on first use."],
+        })
+
+    svc = _service(tmp_path, llm)
+    decision = svc.review(_request(content="diff with retry guard and test"))
+    review = decision.per_model["model-a"]
+
+    assert review["strengths"][0]["evidence"] == (
+        "scheduler.py:214 and test_retry_side_effects"
+    )
+    assert review["findings"][0]["action"] == "Run one provider smoke before merge."
+    assert review["tests_observed"] == [
+        "test_retry_side_effects proves one send across a retry",
+    ]
+    assert review["test_gaps"] == ["No live provider smoke is present."]
+    assert review["residual_risks"] == [
+        "One additional model round trip on first use.",
+    ]
+    assert all("CI status is not proof of runtime behavior" in item[0] for item in prompts)
     svc.close()
 
 
@@ -138,12 +191,35 @@ def test_malformed_member_loses_vote_but_council_proceeds(tmp_path):
 def test_quorum_failure_is_rework_never_approve(tmp_path):
     def llm(member, system, user):
         if member.id == "model-a":
-            return json.dumps({"self_scores": GOOD, "recommendation": "approve",
-                               "rationale": "ok"})
+            return json.dumps({
+                "self_scores": GOOD,
+                "recommendation": "approve",
+                "rationale": "Retry guard is correct but quorum is unavailable.",
+                "strengths": [{
+                    "claim": "The guard is idempotent.",
+                    "evidence": "scheduler.py:214",
+                }],
+                "tests_observed": ["test_retry_guard passes"],
+                "test_gaps": [],
+                "findings": [],
+                "residual_risks": ["Only one reviewer completed."],
+            })
         return "garbage" if member.id == "model-b" else "also garbage"
     svc = _service(tmp_path, llm, min_quorum=2)
     d = svc.review(_request())
     assert d.decision == "REWORK" and "insufficient_quorum" in d.reason
+    assert d.per_model["model-a"]["provider"] == "provider-a"
+    assert d.per_model["model-a"]["weight"] == 1.1
+    assert d.metrics["configured_weight"] == 3.0
+    assert d.metrics["completed_weight"] == 1.1
+    assert d.metrics["approving_weight"] == 1.1
+    assert d.per_model["model-a"]["strengths"] == [{
+        "claim": "The guard is idempotent.",
+        "evidence": "scheduler.py:214",
+    }]
+    assert d.per_model["model-a"]["tests_observed"] == [
+        "test_retry_guard passes",
+    ]
     svc.close()
 
 
@@ -253,6 +329,7 @@ def test_persist_hook_receives_full_session(tmp_path):
     row = svc._conn.execute("SELECT engraphis_ref FROM council_sessions WHERE id=?",
                             (d.session_id,)).fetchone()
     assert row["engraphis_ref"] == "mem-verdict-1"
+    assert d.engraphis_ref == "mem-verdict-1"
     svc.close()
 
 
