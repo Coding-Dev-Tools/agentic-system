@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic-system"
-version = "0.2.0"
+version = "0.3.0"
 description = "Framework-agnostic orchestration layer for autonomous agents: durable event store, deterministic FSM, circuit breakers, no-progress detection, workflow DAG engine, model council, sweeps, and a status/health CLI."
 readme = "README.md"
 license = { text = "MIT" }
