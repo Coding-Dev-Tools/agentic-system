@@ -20,7 +20,8 @@ daily_consolidate  nightly   archive-then-prune old events to _archive/ (repo
                              consolidation CLI when installed
 =================  ========  =====================================================
 
-CLI:  python -m agentic_system.sweeps <heartbeat|stuck_tasks|metrics|breaker_recovery|consolidate|register>
+CLI:  python -m agentic_system.sweeps <heartbeat|stuck_tasks|metrics|
+      breaker_recovery|consolidate|register>
 Env:  AGENTIC_EVENTS_DB (or HERMES_EVENTS_DB, back-compat) overrides the DB path.
 """
 
@@ -131,7 +132,8 @@ def heartbeat_sweep(db_path: Optional[str] = None,
         return {"sweep": "heartbeat", "stale_agents": [r["id"] for r in stale],
                 "requeued_tasks": requeued}
     finally:
-        conn.close(); store.close()
+        conn.close()
+        store.close()
 
 
 # ── 2. stuck task sweep (5 min) ───────────────────────────────────────────
@@ -194,7 +196,8 @@ def stuck_task_sweep(db_path: Optional[str] = None,
         return {"sweep": "stuck_tasks", "requeued": requeued,
                 "escalated": escalated, "failed": failed}
     finally:
-        conn.close(); store.close()
+        conn.close()
+        store.close()
 
 
 # ── 3. metric watchdog (10 min) ───────────────────────────────────────────
@@ -246,7 +249,9 @@ def metric_watchdog(db_path: Optional[str] = None,
         return {"sweep": "metrics", "window_s": window_s, "totals": totals,
                 "fail_ratio": round(ratio, 3), "tripped": tripped}
     finally:
-        breakers.close_conn(); conn.close(); store.close()
+        breakers.close_conn()
+        conn.close()
+        store.close()
 
 
 # ── 4. breaker recovery sweep (2 min) ────────────────────────────────
@@ -308,7 +313,9 @@ def breaker_recovery_sweep(db_path: Optional[str] = None,
                 "moved_to_half_open": moved_half, "closed": closed,
                 "reopened": reopened}
     finally:
-        breakers.close_conn(); conn.close(); store.close()
+        breakers.close_conn()
+        conn.close()
+        store.close()
 
 
 # ── 5. daily consolidate (nightly) ────────────────────────────────────────
@@ -408,7 +415,8 @@ def daily_consolidate(db_path: Optional[str] = None,
                 "archive": str(archive) if pruned else None,
                 "engraphis": engraphis_result}
     finally:
-        conn.close(); store.close()
+        conn.close()
+        store.close()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
@@ -490,7 +498,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args and args[0] == "register":
             print(json.dumps(register_sweeps(), ensure_ascii=False, indent=2))
             return 0
-        print(f"usage: python -m agentic_system.sweeps <{'|'.join(_SWEEPS)}|register>", file=sys.stderr)
+        print(f"usage: python -m agentic_system.sweeps <{'|'.join(_SWEEPS)}|register>",
+              file=sys.stderr)
         return 2
     result = _SWEEPS[args[0]]()
     print(json.dumps(result, ensure_ascii=False))

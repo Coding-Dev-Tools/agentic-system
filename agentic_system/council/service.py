@@ -1269,7 +1269,9 @@ def make_engraphis_persist_hook(namespace_workspace: str = "hermes-council"):
             extractor=settings.extractor,
         )
     except Exception as e:
-        log.warning("engraphis MemoryService could not be built -- council verdict persistence disabled (%s)", e)
+        log.warning(
+            "engraphis MemoryService could not be built -- "
+            "council verdict persistence disabled (%s)", e)
         return lambda doc: None
 
     def hook(doc: dict) -> Optional[str]:

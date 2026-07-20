@@ -169,9 +169,10 @@ def _fmt_human(s: dict[str, Any]) -> str:
         lines.append("")
         lines.append(f"--- council sessions ({len(cs)} shown) ---")
         for c in cs[:15]:
+            eng = (f"  engraphis={c.get('engraphis_ref')}"
+                   if c.get("engraphis_ref") else "")
             lines.append(f"  {c['id']} {c.get('status')} -> {c.get('decision')}"
-                         f" conf={c.get('confidence')}"
-                         + (f"  engraphis={c.get('engraphis_ref')}" if c.get("engraphis_ref") else ""))
+                         f" conf={c.get('confidence')}{eng}")
 
     ev = s["recent_events"]
     lines.append("")
