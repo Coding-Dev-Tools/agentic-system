@@ -204,14 +204,6 @@ class CouncilMember(BaseModel):
     weight: float = 1.0
     base_url: Optional[str] = None   # for custom/OpenAI-compatible providers
     api_key: Optional[str] = Field(default=None, repr=False)  # paired with base_url
-    # Optional routing/persona metadata. `model` is the actual LLM model name to
-    # call (e.g. "qwen-3.8-max-preview-thinking"); when absent, callers fall
-    # back to `id` for backward compatibility. `role` is a free-form persona
-    # label (e.g. "orchestrator", "reviewer", "security") used by drivers/agents
-    # for prompt construction and task routing. Both are metadata: the council
-    # service never reads them for scoring or aggregation.
-    model: Optional[str] = None
-    role: Optional[str] = None
 
     @field_validator("id")
     @classmethod
