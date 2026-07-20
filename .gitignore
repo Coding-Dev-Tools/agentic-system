@@ -31,6 +31,13 @@ venv/
 .idea/
 .DS_Store
 
+# Windows device-name artifacts (redirecting to NUL can create a literal file)
+nul
+
+# Stray cron/workflow temp files with mangled Windows paths
+# (Windows replaces ':' with U+F03A in filenames, so match broadly)
+C*Users*
+
 # Local build output (do not ship build artifacts in the repo)
 dist-build/
 *.whl
