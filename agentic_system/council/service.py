@@ -1243,7 +1243,7 @@ class CouncilService:
         self._conn.close()
 
 
-def make_engraphis_persist_hook(namespace_workspace: str = "hermes-council"):
+def make_engraphis_persist_hook(namespace_workspace: str = "default"):
     """Returns a persist_hook writing verdicts to Engraphis (best-effort import;
     None-returning no-op when engraphis isn't installed in this environment).
 
