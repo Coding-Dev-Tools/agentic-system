@@ -360,7 +360,7 @@ class CouncilRequest(BaseModel):
 
 
 class ModelReview(BaseModel):
-    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
     model_id: str = ""
     self_scores: dict[str, float]
     recommendation: str
