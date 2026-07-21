@@ -359,12 +359,36 @@ class CouncilRequest(BaseModel):
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
+class ReviewStrength(BaseModel):
+    """A positive review claim tied to observable evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+    claim: str = Field(min_length=1, max_length=1200)
+    evidence: str = Field(min_length=1, max_length=2400)
+
+
+class ReviewFinding(BaseModel):
+    """A concrete problem or risk and the action it warrants."""
+
+    model_config = ConfigDict(extra="forbid")
+    severity: Literal["blocking", "non_blocking", "risk"]
+    problem: str = Field(min_length=1, max_length=1200)
+    evidence: str = Field(min_length=1, max_length=2400)
+    action: str = Field(default="", max_length=1200)
+
+
+
 class ModelReview(BaseModel):
     model_config = ConfigDict(extra="ignore", protected_namespaces=())
     model_id: str = ""
     self_scores: dict[str, float]
     recommendation: str
     rationale: str = Field(default="", max_length=4000)
+    strengths: list[ReviewStrength] = Field(default_factory=list, max_length=8)
+    findings: list[ReviewFinding] = Field(default_factory=list, max_length=12)
+    tests_observed: list[str] = Field(default_factory=list, max_length=12)
+    test_gaps: list[str] = Field(default_factory=list, max_length=12)
+    residual_risks: list[str] = Field(default_factory=list, max_length=12)
 
     @field_validator("self_scores")
     @classmethod
@@ -420,6 +444,7 @@ class CouncilDecision(BaseModel):
     cached: bool = False
     reason: str = ""
     gate: Optional[str] = None
+    engraphis_ref: Optional[str] = None
 
     @field_validator("decision")
     @classmethod
@@ -431,6 +456,7 @@ class CouncilDecision(BaseModel):
 
 __all__ = [
     "CouncilMember", "CouncilThresholds", "CouncilRequest", "ModelReview",
-    "PeerScore", "PeerEval", "CouncilDecision", "DimensionPolicy", "GatePolicy",
-    "ScoreDirection", "DEFAULT_DIMENSIONS", "GATE_POLICIES", "RECOMMENDATIONS",
+    "ReviewStrength", "ReviewFinding", "PeerScore", "PeerEval", "CouncilDecision",
+    "DimensionPolicy", "GatePolicy", "ScoreDirection", "DEFAULT_DIMENSIONS",
+    "GATE_POLICIES", "RECOMMENDATIONS",
 ]

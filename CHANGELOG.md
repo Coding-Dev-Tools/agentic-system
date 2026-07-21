@@ -14,6 +14,9 @@ All notable changes to agentic-system are documented here. The format follows
   stages; deadline-aware LLM adapters receive `timeout_seconds`.
 - **council** — per-member outcomes for success, timeout, provider error,
   invalid output, and cooldown.
+- **council** — decision payloads now disclose each reviewer model's provider
+  and configured weight, plus configured, completed, and approving weight totals
+  so downstream review comments can explain the exact weighted verdict.
 
 ### Changed
 - Council aggregation now weights member scores consistently and applies only
@@ -37,6 +40,8 @@ All notable changes to agentic-system are documented here. The format follows
 - Positional-only parameters are no longer mistaken for keyword timeout
   support; peer-call outcomes remain visible even when that member's initial
   review failed.
+- `CouncilDecision.engraphis_ref` now exposes the reference returned by a
+  successful persistence hook instead of leaving callers with a false `None`.
 
 ## [0.2.0] — 2026-07-11
 

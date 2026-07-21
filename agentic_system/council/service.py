@@ -65,8 +65,22 @@ REVIEW_SYSTEM = (
     "direction for every dimension. Respond with ONLY one JSON object matching:\n"
     '{"self_scores": {<dimension>: <number {lo}-{hi}>, ...}, '
     '"recommendation": "approve|approve_with_nits|rework|reject", '
-    '"rationale": "<short evidence-based reason>"}\n'
-    "Include every declared dimension exactly once. Do not invent tool results."
+    '"rationale": "<root-cause and verdict assessment>", '
+    '"strengths": [{"claim": "<verified strength>", '
+    '"evidence": "<file, diff hunk, test, or check>"}], '
+    '"findings": [{"severity": "blocking|non_blocking|risk", '
+    '"problem": "<concrete issue or limitation>", '
+    '"evidence": "<file, diff hunk, test, reproduction, or missing proof>", '
+    '"action": "<specific next action or empty string>"}], '
+    '"tests_observed": ["<test/check and what it proves>"], '
+    '"test_gaps": ["<behavior not demonstrated>"], '
+    '"residual_risks": ["<accepted uncertainty or operational cost>"]}\n'
+    "Include every declared dimension exactly once and address every checklist "
+    "item. Tie every positive or negative claim to evidence present in the "
+    "artifact. If a claim cannot be verified, label it as a test gap or residual "
+    "risk instead of stating it as fact. CI status is not proof of runtime "
+    "behavior. Even an approval must communicate substantive strengths and any "
+    "remaining uncertainty. Do not invent tool results."
 )
 
 PEER_SYSTEM = (
@@ -77,7 +91,7 @@ PEER_SYSTEM = (
     "Score every supplied review exactly once."
 )
 
-_CACHE_POLICY_VERSION = "gate-policy-v1"
+_CACHE_POLICY_VERSION = "gate-policy-v2-evidence-rich-reviews"
 
 
 def _accepts_timeout_keyword(fn: Callable[..., str]) -> bool:
@@ -412,6 +426,16 @@ class CouncilService:
 
         reviews, call_outcomes = self._stage1(request, deadline)
         if len(reviews) < self.min_quorum:
+            member_by_id = {member.id: member for member in self.members}
+            configured_weight = sum(member.weight for member in self.members)
+            completed_weight = sum(
+                member_by_id[member_id].weight for member_id in reviews
+            )
+            approving_weight = sum(
+                member_by_id[member_id].weight
+                for member_id, review in reviews.items()
+                if review.approves
+            )
             decision = CouncilDecision(
                 session_id=session_id,
                 decision="REWORK",
@@ -419,9 +443,38 @@ class CouncilService:
                     f"insufficient_quorum: {len(reviews)}/{self.min_quorum} "
                     "valid reviews"
                 ),
-                metrics={"elapsed_seconds": round(time.monotonic() - started, 3)},
+                metrics={
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "configured_weight": round(configured_weight, 3),
+                    "completed_weight": round(completed_weight, 3),
+                    "approving_weight": round(approving_weight, 3),
+                },
                 per_model={
-                    member_id: {"call": outcome}
+                    member_id: {
+                        "provider": member_by_id[member_id].provider,
+                        "weight": member_by_id[member_id].weight,
+                        "call": outcome,
+                        **({
+                            "self": reviews[member_id].self_scores,
+                            "recommendation": reviews[member_id].recommendation,
+                            "rationale": reviews[member_id].rationale,
+                            "strengths": [
+                                item.model_dump()
+                                for item in reviews[member_id].strengths
+                            ],
+                            "findings": [
+                                item.model_dump()
+                                for item in reviews[member_id].findings
+                            ],
+                            "tests_observed": list(
+                                reviews[member_id].tests_observed
+                            ),
+                            "test_gaps": list(reviews[member_id].test_gaps),
+                            "residual_risks": list(
+                                reviews[member_id].residual_risks
+                            ),
+                        } if member_id in reviews else {}),
+                    }
                     for member_id, outcome in call_outcomes.items()
                 },
                 gate=request.gate,
@@ -753,6 +806,15 @@ class CouncilService:
                 "self_scores": review.self_scores,
                 "recommendation": review.recommendation,
                 "rationale": review.rationale,
+                "strengths": [
+                    strength.model_dump() for strength in review.strengths
+                ],
+                "findings": [
+                    finding.model_dump() for finding in review.findings
+                ],
+                "tests_observed": review.tests_observed,
+                "test_gaps": review.test_gaps,
+                "residual_risks": review.residual_risks,
             }
             for member_id, review in sorted(reviews.items())
         ], indent=1)
@@ -881,6 +943,8 @@ class CouncilService:
         aggregate: dict[str, dict[str, Any]] = {}
         for member in self.members:
             member_outcome: dict[str, Any] = {
+                "provider": member.provider,
+                "weight": member.weight,
                 "call": call_outcomes.get(member.id, {}),
             }
             peer_call = call_outcomes.get(f"peer:{member.id}")
@@ -917,6 +981,15 @@ class CouncilService:
                 "self": review.self_scores,
                 "recommendation": review.recommendation,
                 "rationale": review.rationale,
+                "strengths": [
+                    strength.model_dump() for strength in review.strengths
+                ],
+                "findings": [
+                    finding.model_dump() for finding in review.findings
+                ],
+                "tests_observed": list(review.tests_observed),
+                "test_gaps": list(review.test_gaps),
+                "residual_risks": list(review.residual_risks),
             })
 
         total_weight = sum(weights[member_id] for member_id in reviews)
@@ -988,6 +1061,9 @@ class CouncilService:
         metrics = {
             "avg_overall": round(avg_overall, 3),
             "agreement": round(agreement, 3),
+            "configured_weight": round(sum(weights.values()), 3),
+            "completed_weight": round(total_weight, 3),
+            "approving_weight": round(approve_weight, 3),
         }
         metrics.update({
             f"avg_{name}": round(value, 3)
@@ -1203,6 +1279,7 @@ class CouncilService:
                 })
             except Exception:
                 logger.exception("council persist_hook failed")
+        decision.engraphis_ref = engraphis_ref
         confidence = decision.metrics.get("agreement", 0.0)
         self._conn.execute(
             """UPDATE council_sessions SET status=?, decision=?,
