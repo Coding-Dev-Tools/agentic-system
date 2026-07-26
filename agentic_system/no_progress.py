@@ -1,93 +1,118 @@
-"""No-progress loop detection for agents.
+"""No-progress (loop) detection for agent tool-call cycles.
 
-The default ``NoProgressDetector`` uses difflib (catches verbatim loops).
-For semantic looping, back it with embeddings — either sentence-transformers
-or your own callable against Engraphis's embedder.
+Tracks a small window of recent tool outputs; when every pairwise similarity
+in the window stays above a threshold AND no new state was written, the agent
+is considered to be looping and the task should fail with
+``reason="no_progress"``.
 
-Usage::
-
-    from agentic_system.no_progress import NoProgressDetector
-    from agentic_system.embedding_similarity import make_embedding_similarity
-
-    # Deterministic (stdlib only):
-    det = NoProgressDetector(window=3, threshold=0.9)
-
-    # Semantic (requires sentence-transformers or custom callable):
-    det = NoProgressDetector(window=3, threshold=0.85,
-                             similarity=make_embedding_similarity())
+Similarity defaults to stdlib ``difflib.SequenceMatcher`` — dependency-free and
+good enough for verbatim/near-verbatim repetition, which is what runaway agent
+loops actually produce. Pass a ``similarity=`` callable to upgrade to semantic
+similarity (e.g. sentence-transformer or Engraphis embedding cosine) when
+semantic-level looping shows up in practice — see
+``agentic_system.embedding_similarity`` for a ready-made sentence-transformer
+backing (``pip install "agentic-system[embeddings]"``), or build your own
+against Engraphis' embedder.
 """
 
 from __future__ import annotations
 
-import difflib
+import re
+from collections import deque
+from difflib import SequenceMatcher
 from typing import Callable, Optional
 
-try:
-    from agentic_system.ports import get_config_port
-except Exception:
-    def get_config_port():
-        class _Dummy:
-            def orchestration_enabled(self): return False
-        return _Dummy()
+
+class NoProgress(Exception):
+    """Raised when a no-progress loop is detected.
+
+    A host handler/agent loop raises this (or calls :meth:`NoProgressDetector.raise_if_looping`)
+    to surface a loop as control flow; the workflow worker maps it onto the
+    FSM ``no_progress`` event (EXECUTING -> FAILED) instead of ``tool_error``."""
+
+_WS = re.compile(r"\s+")
 
 
-class SimilarityFn(Callable[[str, str], float]):
-    """Callable that returns a similarity score in [0, 1] for two texts."""
-    pass
+# A similarity fn: (a, b) -> float in [0, 1]. Defaults to difflib ratio.
+SimilarityFn = Callable[[str, str], float]
 
 
-def _difflib_similarity(a: str, b: str) -> float:
-    """Stdlib difflib ratio — fast, catches verbatim/near-verbatim loops."""
-    return difflib.SequenceMatcher(None, a, b).ratio()
+def _normalize(text: str) -> str:
+    return _WS.sub(" ", (text or "").strip())
+
+
+def default_similarity(a: str, b: str) -> float:
+    if not a and not b:
+        return 1.0
+    return SequenceMatcher(None, a, b).ratio()
 
 
 class NoProgressDetector:
-    """Sliding-window no-progress detector.
+    """Sliding-window repetition detector.
 
-    Args:
-        window: How many recent turns to compare (2-10 typical).
-        threshold: Similarity threshold in [0, 1]. Above = loop.
-        similarity: Callable(a, b) -> float in [0, 1]. Defaults to difflib.
+    Usage::
+
+        det = NoProgressDetector(window=3, threshold=0.97)
+        looping = det.observe(tool_output, state_changed=wrote_anything)
+        if looping:
+            fail_task(reason="no_progress")
+
+    Pass ``similarity=`` to back the comparison with embeddings (semantic loop
+    detection) instead of difflib.
     """
-    def __init__(self, window: int = 3, threshold: float = 0.9,
-                 similarity: Optional[SimilarityFn] = None):
-        if not (2 <= window <= 10):
-            raise ValueError("window must be 2..10")
-        if not (0.0 <= threshold <= 1.0):
-            raise ValueError("threshold must be 0..1")
-        self.window = window
-        self.threshold = threshold
-        self.similarity = similarity or _difflib_similarity
-        self._history: list[str] = []
 
-    def record(self, output: str) -> bool:
-        """Record a turn's output. Returns True if a loop is detected."""
-        self._history.append(output)
-        if len(self._history) > self.window:
-            self._history.pop(0)
-        if len(self._history) < self.window:
+    def __init__(self, window: int = 3, threshold: float = 0.97,
+                 max_chars: int = 4000,
+                 similarity: Optional[SimilarityFn] = None):
+        if window < 2:
+            raise ValueError("window must be >= 2")
+        self.window = window
+        self.threshold = float(threshold)
+        self.max_chars = int(max_chars)
+        self._similarity: SimilarityFn = similarity or default_similarity
+        self._outputs: deque[str] = deque(maxlen=window)
+        self.trip_count = 0
+
+    def observe(self, output: str, state_changed: bool = False) -> bool:
+        """Record one tool output. Returns True when a loop is detected.
+
+        ``state_changed=True`` means the step produced a real side effect
+        (file written, task state advanced, new event appended) — that resets
+        the window, since repeated *reads* with identical output are only a
+        loop when nothing is being accomplished between them.
+        """
+        text = _normalize(output)[: self.max_chars]
+        if state_changed:
+            self._outputs.clear()
+            self._outputs.append(text)
             return False
-        # Compare the newest against each prior in the window
-        newest = self._history[-1]
-        for prior in self._history[:-1]:
-            if self.similarity(newest, prior) >= self.threshold:
-                return True
+        self._outputs.append(text)
+        if len(self._outputs) < self.window:
+            return False
+        outs = list(self._outputs)
+        sims = [
+            self._similarity(outs[i], outs[j])
+            for i in range(len(outs))
+            for j in range(i + 1, len(outs))
+        ]
+        if min(sims) >= self.threshold:
+            self.trip_count += 1
+            return True
         return False
 
     def reset(self) -> None:
-        self._history.clear()
+        self._outputs.clear()
+
+    def raise_if_looping(self, output: str, state_changed: bool = False) -> None:
+        """Observe one output and raise :class:`NoProgress` if a loop is detected.
+
+        Convenience for hosts that treat loop detection as control flow (the
+        workflow worker catches ``NoProgress`` and drives the FSM ``no_progress``
+        transition). Never raises when ``state_changed`` is True."""
+        if self.observe(output, state_changed=state_changed):
+            raise NoProgress(
+                f"no progress: {self.window} recent outputs >= "
+                f"{self.threshold} similarity (trip #{self.trip_count})")
 
 
-def make_no_progress_detector() -> NoProgressDetector:
-    """Factory using ConfigPort (host may override threshold/window/embedding)."""
-    try:
-        cfg = get_config_port()
-        if cfg.orchestration_enabled():
-            cc = cfg.council_config() or {}
-            np = cc.get("no_progress", {})
-            window = int(np.get("window", 3))
-            threshold = float(np.get("threshold", 0.9))
-            return NoProgressDetector(window=window, threshold=threshold)
-    except Exception:
-        pass
-    return NoProgressDetector()
+__all__ = ["NoProgressDetector", "default_similarity", "SimilarityFn", "NoProgress"]

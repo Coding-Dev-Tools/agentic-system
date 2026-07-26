@@ -1,59 +1,43 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.3.x   | :white_check_mark: |
-| 0.2.x   | :x:                |
-| 0.1.x   | :x:                |
+Only the latest released version of `agentic-system` receives security fixes.
+Pin the version (`pip install agentic-system==0.x.y`) and watch the
+[releases page](https://github.com/Coding-Dev-Tools/agentic-system/releases)
+for updates.
 
-## Reporting a Vulnerability
+## Scope
 
-Please report security vulnerabilities privately:
+`agentic-system` is an **optional orchestration layer** — it does not itself
+execute arbitrary code, call out to the network, or run on untrusted input.
+Security-relevant surface is intentionally small:
 
-1. Email: **security@coding-dev-tools.org**
-2. Or use GitHub's private vulnerability reporting (Security tab → "Report a vulnerability")
+- It can refuse high-impact tool calls when a circuit breaker is OPEN
+  (`breaker.high_impact_block_message`) — that gate must never silently
+  allow. Bugs that let an OPEN breaker's high-impact actions through are
+  security-relevant.
+- It persists control-flow events and council verdicts to SQLite, and
+  (optionally) to Engraphis. It does not redact secrets in payloads; hosts
+  are responsible for not emitting secrets into the event stream.
+- Optional integration installs third-party packages (`sentence-transformers`,
+  `engraphis`) — supply-chain issues in those belong to their projects.
 
-Include:
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact
-- Suggested fix (if any)
+## Reporting a vulnerability
 
-We will acknowledge receipt within 48 hours and provide a timeline for fix.
+**Please do NOT open a public issue.** Email security concerns to the
+maintainers via a private GitHub Security Advisory:
 
-## Security Considerations
+1. Go to <https://github.com/Coding-Dev-Tools/agentic-system/security/advisories/new>
+2. Click "Report a vulnerability" and describe the issue + repro.
 
-### Agentic-System Specific
+You'll get an acknowledgement within 5 business days. Please give us 90 days
+to triage and ship a fix before any public disclosure. Coordinated disclosure
+is happy to credit you in the release advisory.
 
-1. **Circuit Breakers**: The global breaker blocks high-impact tools (deploy/push/publish). Misconfiguration could block legitimate operations. Test in staging first.
+## Hardening tips for hosts
 
-2. **Model Council**: Council decisions affect code merges/deployments. Ensure:
-   - Council members are from trusted providers
-   - Thresholds are appropriate for your risk tolerance
-   - Verdict cache doesn't stale-approve changed artifacts
-
-3. **Workflow Engine**: CAS claiming prevents double-execution. Ensure idempotency keys are unique per task+inputs.
-
-4. **Event Store**: Events are append-only with WAL. Ensure DB path is on durable storage.
-
-5. **Sweeps**: Nightly consolidate archives old events. Verify `EVENT_RETENTION_DAYS` meets compliance.
-
-### General
-
-- Keep dependencies updated (`pip-audit` / `dependabot`)
-- Use virtual environments
-- Never commit secrets (API keys, tokens) to version control
-- Run `pip install -e ".[dev]"` and `ruff check` before committing
-
-## Disclosure Policy
-
-We follow responsible disclosure. Once a fix is ready, we will:
-1. Release a patch version
-2. Publish a security advisory on GitHub
-3. Credit the reporter (unless anonymity requested)
-
-## Contact
-
-Security team: **security@coding-dev-tools.org**
+- Run agent worker processes with least privilege; breakers gate destructive
+  tools but cannot sandbox arbitrary subprocess execution.
+- Set the events DB to a directory writable only by the agent process.
+- Register a `CronPort` whose `scripts_dir` is not on a shared/tmp filesystem.

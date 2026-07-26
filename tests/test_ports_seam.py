@@ -185,14 +185,14 @@ def test_council_constructor_args_override_config(restore, tmp_path):
     ports.set_config_port(_FakeConfigPort(council={
         "members": [{"id": "cfg-model", "weight": 1.0}],
         "thresholds": {"min_overall": 2.0},
-        "peer_eval": "never", "min_quorum": 1}))
+        "peer_eval": "never", "min_quorum": 2}))
     from agentic_system.council import CouncilService
     svc = CouncilService(
         str(tmp_path / "p.db"),
         members=[{"id": "ctor-model", "weight": 1.0}],
-        thresholds={"min_overall": 4.5}, peer_eval="always", min_quorum=5)
+        thresholds={"min_overall": 4.5}, peer_eval="always", min_quorum=1)
     assert [m.id for m in svc.members] == ["ctor-model"]
     assert svc.thresholds.min_overall == 4.5
     assert svc.peer_eval == "always"        # ctor wins (previously config won here)
-    assert svc.min_quorum == 5              # ctor wins (previously config won here)
+    assert svc.min_quorum == 1              # ctor wins (previously config won here)
     svc.close()

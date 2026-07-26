@@ -4,7 +4,7 @@ Layering: the host process-liveness watchdog (every 10 min) is the layer
 BELOW this and stays untouched; breakers are behavioral safety ABOVE it —
 they stop agents from *doing* things, not processes from running.
 
-States: CLOSED (normal) -> OPEN (tripped) -> HALF_OPEN (probation) -> CLOSED.
+States: CLOSED (normal) → OPEN (tripped) → HALF_OPEN (probation) → CLOSED.
 Persisted so restarts are idempotent (state survives in the events DB).
 
 Global-open side effects:
@@ -13,11 +13,6 @@ Global-open side effects:
   log; ``alert_path=None`` means no file is written),
 - ``should_accept_task()`` / ``allow_high_impact()`` return False, which
   workflow workers and deploy-ish tools must check before acting.
-
-Self-heal (from Hermes):
-- Global breaker auto-recovers after configurable cooldown if no new
-  high-impact failures observed.
-- Agent/workflow breakers auto-close on successful task completion.
 """
 
 from __future__ import annotations
@@ -28,14 +23,17 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from agentic_system.events import connect, ensure_state_tables, now_iso
-from agentic_system.ports import get_config_port
+from agentic_system.events.state_tables import connect, ensure_state_tables, now_iso
 
 logger = logging.getLogger("agentic_system.breakers")
 
 CLOSED, OPEN, HALF_OPEN = "CLOSED", "OPEN", "HALF_OPEN"
 LEVELS = ("agent", "workflow", "global")
 GLOBAL_KEY = "system"
+
+# Generic default: no alert file (a host passes alert_path=... to
+# BreakerRegistry, e.g. a host points it at its incident-log file).
+_DEFAULT_ALERT: Optional[str] = None
 
 # Tool-name patterns blocked when the global breaker is OPEN (the
 # high-impact set). Kept in sync with state_machine._HIGH_IMPACT.
@@ -77,7 +75,7 @@ def get_registry(db_path: Optional[str] = None) -> "BreakerRegistry":
     global _registry_cache
     if _registry_cache is not None and db_path is None:
         return _registry_cache
-    from agentic_system.events import events_db_path, get_bus
+    from agentic_system.events.hooks import events_db_path, get_bus
     reg = BreakerRegistry(db_path or events_db_path(), bus=get_bus())
     if db_path is None:
         _registry_cache = reg
@@ -96,7 +94,7 @@ def reset_registry_for_tests() -> None:
 
 
 def high_impact_block_message(tool_name: str,
-                              tool_args: Optional[dict] = None) -> Optional[str]:
+                             tool_args: Optional[dict] = None) -> Optional[str]:
     """Return a block message if ``tool_name`` is high-impact and the global
     circuit breaker is OPEN. ``None`` means "allow".
 
@@ -142,13 +140,9 @@ class BreakerRegistry:
         self._conn = connect(db_path)
         ensure_state_tables(self._conn)
         self.bus = bus
-        self.alert_path = str(alert_path) if alert_path else None
-        # Self-heal config (can be overridden by host config)
-        self.global_auto_recover_seconds = 300  # 5 min default
-        self.agent_auto_close_on_success = True
-        self.workflow_auto_close_on_success = True
+        self.alert_path = str(alert_path) if alert_path else _DEFAULT_ALERT
 
-    # ── Queries ──────────────────────────────────────────────────────────
+    # ── queries ──────────────────────────────────────────────────────────
     def state(self, level: str, key: str) -> str:
         row = self._conn.execute(
             "SELECT state FROM breakers WHERE level=? AND key=?", (level, key)
@@ -178,25 +172,7 @@ class BreakerRegistry:
             "SELECT * FROM breakers ORDER BY level, key").fetchall()
         return [dict(r) for r in rows]
 
-    def try_self_heal(self) -> dict[str, str]:
-        """Attempt self-heal transitions. Returns dict of changes made."""
-        changes = {}
-        # Global auto-recover
-        if self.is_open("global", GLOBAL_KEY):
-            row = self._conn.execute(
-                "SELECT opened_at FROM breakers WHERE level='global' AND key=?",
-                (GLOBAL_KEY,)
-            ).fetchone()
-            if row and row["opened_at"]:
-                from datetime import datetime
-                opened = datetime.fromisoformat(row["opened_at"].replace("Z", ""))
-                elapsed = (datetime.utcnow() - opened).total_seconds()
-                if elapsed >= self.global_auto_recover_seconds:
-                    self.half_open("global", GLOBAL_KEY, "auto-recover cooldown elapsed")
-                    changes["global"] = "HALF_OPEN (auto-recover)"
-        return changes
-
-    # ── Transitions ──────────────────────────────────────────────────────
+    # ── transitions ──────────────────────────────────────────────────────
     def _set(self, level: str, key: str, state: str, reason: str = "") -> None:
         if level not in LEVELS:
             raise ValueError(f"unknown breaker level {level!r}")
@@ -236,17 +212,7 @@ class BreakerRegistry:
         self._set(level, key, CLOSED, reason)
         self._emit("breaker.closed", level, key, reason)
 
-    def record_success(self, agent_id: Optional[str] = None,
-                       workflow: Optional[str] = None) -> None:
-        """Called on successful task completion — auto-closes agent/workflow breakers."""
-        if agent_id and self.agent_auto_close_on_success:
-            if self.is_open("agent", agent_id):
-                self.close("agent", agent_id, "task succeeded")
-        if workflow and self.workflow_auto_close_on_success:
-            if self.is_open("workflow", workflow):
-                self.close("workflow", workflow, "task succeeded")
-
-    # ── Side effects ─────────────────────────────────────────────────────
+    # ── side effects ─────────────────────────────────────────────────────
     def _emit(self, type: str, level: str, key: str, reason: str,
               priority: str = "high") -> None:
         if self.bus is None:
@@ -264,7 +230,7 @@ class BreakerRegistry:
     def _write_alert(self, reason: str) -> None:
         try:
             if self.alert_path is None:
-                return
+                return  # no alert file configured
             p = Path(self.alert_path)
             if not p.parent.exists():
                 logger.warning("alert dir missing, skipping alert file write: %s", p)
