@@ -34,7 +34,10 @@ Changelog = "https://github.com/Coding-Dev-Tools/agentic-system/blob/main/CHANGE
 [project.optional-dependencies]
 engraphis = ["engraphis"]          # council verdict persistence to Engraphis
 embeddings = ["sentence-transformers"]  # semantic no-progress detection upgrade path
-test = ["pytest>=7"]
+test = [
+    "pytest>=7",
+    "tomli>=2; python_version < '3.11'",
+]
 
 [project.scripts]
 agentic-status = "agentic_system.orchestration_status:main"
